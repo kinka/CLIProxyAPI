@@ -178,6 +178,9 @@ func (s *Service) registerModelsForAuthWithCache(ctx context.Context, a *coreaut
 			}
 		}
 		models = applyExcludedModels(models, excluded)
+	case "trae":
+		models = registry.GetTraeModels()
+		models = applyExcludedModels(models, excluded)
 	default:
 		// Handle OpenAI-compatibility providers by name using config
 		if s.cfg != nil {
