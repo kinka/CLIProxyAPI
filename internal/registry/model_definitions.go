@@ -35,6 +35,7 @@ type staticModelsJSON struct {
 	XAI         []*ModelInfo `json:"xai"`
 	Devin       []*ModelInfo `json:"devin"`
 	Meta        []*ModelInfo `json:"meta"`
+	Trae        []*ModelInfo `json:"trae"`
 }
 
 // GetClaudeModels returns the standard Claude model definitions.
@@ -504,6 +505,8 @@ func GetStaticModelDefinitionsByChannel(channel string) []*ModelInfo {
 		return GetDevinModels()
 	case "meta", "muse":
 		return GetMetaModels()
+	case "trae":
+		return GetTraeModels()
 	default:
 		return nil
 	}
@@ -529,6 +532,271 @@ func GetMetaModels() []*ModelInfo {
 	return cloneModelInfos(getModels().Meta)
 }
 
+var staticTraeModels = []*ModelInfo{
+	{
+		ID:                  "trae-auto",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Trae Auto (Inline)",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high"},
+		},
+	},
+	{
+		ID:                  "glm-5.2",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.2",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "high"},
+		},
+	},
+	{
+		ID:                  "glm-5.1",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.1",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "high"},
+		},
+	},
+	{
+		ID:                  "glm-5",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "high"},
+		},
+	},
+	{
+		ID:                  "glm-5v-turbo",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5V Turbo",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "glm-4.7",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-4.7",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "glm-4.6",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-4.6",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "doubao-seed-code",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Doubao Seed Code",
+		ContextLength:       256000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "doubao-seed-2.0-code",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Doubao Seed 2.0 Code",
+		ContextLength:       256000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "Doubao_1_6",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Doubao 1.6",
+		ContextLength:       256000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "doubao_1_8",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Doubao 1.8",
+		ContextLength:       256000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "Doubao-Seed-2.1-Pro",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Doubao Seed 2.1 Pro",
+		ContextLength:       256000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "Doubao-Seed-2.1-Turbo",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Doubao Seed 2.1 Turbo",
+		ContextLength:       256000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "DeepSeek-V4-Pro",
+		Type:                "trae",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4 Pro",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+	{
+		ID:                  "DeepSeek-V4-Flash",
+		Type:                "trae",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+	{
+		ID:                  "custom_model_deepseek_reasoner",
+		Type:                "trae",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek R1 Reasoner",
+		ContextLength:       128000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+	{
+		ID:                  "qwen-3.7-plus",
+		Type:                "trae",
+		OwnedBy:             "alibaba",
+		DisplayName:         "Qwen 3.7 Plus",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high"},
+		},
+	},
+	{
+		ID:                  "qwen-3.6-plus",
+		Type:                "trae",
+		OwnedBy:             "alibaba",
+		DisplayName:         "Qwen 3.6 Plus",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high"},
+		},
+	},
+	{
+		ID:                  "qwen-3.5",
+		Type:                "trae",
+		OwnedBy:             "alibaba",
+		DisplayName:         "Qwen 3.5",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "qwen3-coder",
+		Type:                "trae",
+		OwnedBy:             "alibaba",
+		DisplayName:         "Qwen 3 Coder",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "kimi-k2.6",
+		Type:                "trae",
+		OwnedBy:             "moonshot",
+		DisplayName:         "Kimi K2.6",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high"},
+		},
+	},
+	{
+		ID:                  "kimi-k2.5",
+		Type:                "trae",
+		OwnedBy:             "moonshot",
+		DisplayName:         "Kimi K2.5",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "kimi-k2",
+		Type:                "trae",
+		OwnedBy:             "moonshot",
+		DisplayName:         "Kimi K2",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "kimi-k2.7-code",
+		Type:                "trae",
+		OwnedBy:             "moonshot",
+		DisplayName:         "Kimi K2.7 Code",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "minimax-m3",
+		Type:                "trae",
+		OwnedBy:             "minimax",
+		DisplayName:         "MiniMax M3",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "minimax-m2.7",
+		Type:                "trae",
+		OwnedBy:             "minimax",
+		DisplayName:         "MiniMax M2.7",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "minimax-m2.1",
+		Type:                "trae",
+		OwnedBy:             "minimax",
+		DisplayName:         "MiniMax M2.1",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "minimax-m2",
+		Type:                "trae",
+		OwnedBy:             "minimax",
+		DisplayName:         "MiniMax M2",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+	},
+}
+
+// GetTraeModels returns the standard Trae model definitions.
+func GetTraeModels() []*ModelInfo {
+	if m := getModels().Trae; len(m) > 0 {
+		return cloneModelInfos(m)
+	}
+	return cloneModelInfos(staticTraeModels)
+}
+
 // LookupStaticModelInfo searches all static model definitions for a model by ID.
 // Returns nil if no matching model is found.
 func LookupStaticModelInfo(modelID string) *ModelInfo {
@@ -549,6 +817,8 @@ func LookupStaticModelInfo(modelID string) *ModelInfo {
 		data.Devin,
 		staticDevinModels,
 		data.Meta,
+		data.Trae,
+		staticTraeModels,
 	}
 	for _, models := range allModels {
 		for _, m := range models {
