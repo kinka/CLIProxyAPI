@@ -204,8 +204,29 @@ func (s *Server) setupRoutes() {
 		c.String(http.StatusOK, oauthCallbackSuccessHTML)
 	}
 
+	traeCallbackHandler := func(c *gin.Context) {
+		c.Header("Cache-Control", "no-store")
+		code := strings.TrimSpace(c.Query("code"))
+		state := strings.TrimSpace(c.Query("state"))
+		errStr := strings.TrimSpace(c.Query("error"))
+		if errStr == "" {
+			errStr = strings.TrimSpace(c.Query("error_description"))
+		}
+		if code == "" && errStr == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "code or error is required"})
+			return
+		}
+		if _, errWrite := managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "trae", state, code, errStr); errWrite != nil {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
+			return
+		}
+		c.Header("Content-Type", "text/html; charset=utf-8")
+		c.String(http.StatusOK, oauthCallbackSuccessHTML)
+	}
+
 	s.engine.GET("/callback", devinCallbackHandler)
 	s.engine.GET("/devin/callback", devinCallbackHandler)
+	s.engine.GET("/trae/callback", traeCallbackHandler)
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
