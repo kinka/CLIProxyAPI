@@ -170,34 +170,27 @@ func traeStorageFromAuth(auth *cliproxyauth.Auth) *traeauth.TraeTokenStorage {
 		return ts
 	}
 	token := ""
+	var refreshToken, host, authHost, edition, machineID, deviceID, userID, userRegion string
+	var expired, refreshExpired string
+
 	if auth.Metadata != nil {
 		if t, ok := auth.Metadata["access_token"].(string); ok && t != "" {
 			token = t
 		} else if t, ok := auth.Metadata["token"].(string); ok && t != "" {
 			token = t
 		}
-	}
-	if token == "" && auth.Attributes != nil {
-		if t, ok := auth.Attributes["api_key"]; ok && t != "" {
-			token = t
-		} else if t, ok := auth.Attributes["token"]; ok && t != "" {
-			token = t
+		if rt, ok := auth.Metadata["refresh_token"].(string); ok {
+			refreshToken = rt
 		}
-	}
-	host := traeauth.DefaultHostCN
-	if auth.Attributes != nil {
-		if h, ok := auth.Attributes["base_url"]; ok && h != "" {
+		if h, ok := auth.Metadata["host"].(string); ok && h != "" {
 			host = h
 		}
-	}
-	edition := "cn"
-	if auth.Attributes != nil {
-		if ed, ok := auth.Attributes["edition"]; ok && ed != "" {
+		if ah, ok := auth.Metadata["auth_host"].(string); ok && ah != "" {
+			authHost = ah
+		}
+		if ed, ok := auth.Metadata["edition"].(string); ok && ed != "" {
 			edition = ed
 		}
-	}
-	var machineID, deviceID, userID string
-	if auth.Metadata != nil {
 		if m, ok := auth.Metadata["machine_id"].(string); ok {
 			machineID = m
 		}
@@ -207,15 +200,58 @@ func traeStorageFromAuth(auth *cliproxyauth.Auth) *traeauth.TraeTokenStorage {
 		if u, ok := auth.Metadata["user_id"].(string); ok {
 			userID = u
 		}
+		if ur, ok := auth.Metadata["user_region"].(string); ok {
+			userRegion = ur
+		}
+		if exp, ok := auth.Metadata["expired"].(string); ok {
+			expired = exp
+		} else if exp, ok := auth.Metadata["expired"].(float64); ok {
+			expired = fmt.Sprintf("%.0f", exp)
+		}
+		if rexp, ok := auth.Metadata["refresh_expired"].(string); ok {
+			refreshExpired = rexp
+		} else if rexp, ok := auth.Metadata["refresh_expired"].(float64); ok {
+			refreshExpired = fmt.Sprintf("%.0f", rexp)
+		}
+	}
+	if token == "" && auth.Attributes != nil {
+		if t, ok := auth.Attributes["api_key"]; ok && t != "" {
+			token = t
+		} else if t, ok := auth.Attributes["token"]; ok && t != "" {
+			token = t
+		}
+	}
+	if auth.Attributes != nil {
+		if h, ok := auth.Attributes["base_url"]; ok && h != "" {
+			host = h
+		}
+		if ed, ok := auth.Attributes["edition"]; ok && ed != "" {
+			edition = ed
+		}
+	}
+	if host == "" {
+		if strings.EqualFold(edition, "sg") {
+			host = traeauth.DefaultHostSG
+		} else {
+			host = traeauth.DefaultHostCN
+		}
+	}
+	if edition == "" {
+		edition = "cn"
 	}
 	return &traeauth.TraeTokenStorage{
-		AccessToken: token,
-		Host:        host,
-		Edition:     edition,
-		MachineID:   machineID,
-		DeviceID:    deviceID,
-		UserID:      userID,
-		Type:        "trae",
+		AccessToken:    token,
+		RefreshToken:   refreshToken,
+		Expired:        expired,
+		RefreshExpired: refreshExpired,
+		Host:           host,
+		AuthHost:       authHost,
+		Edition:        edition,
+		MachineID:      machineID,
+		DeviceID:       deviceID,
+		UserID:         userID,
+		UserRegion:     userRegion,
+		Type:           "trae",
 	}
 }
 
