@@ -596,6 +596,26 @@ func FormatTraeMessagesWithTools(root gjson.Result) ([]map[string]any, map[strin
 		}
 	}
 
+	// Inject an active tool-use reminder at the end of the final user message.
+	// In long conversations or interactive multi-turn sessions (e.g. Claude Code), models tend to defer
+	// with conversational polite phrases (like "好的，稍等我来查") unless actively reminded at the turn boundary.
+	if len(toolDefs) > 0 && len(msgs) > 0 {
+		lastIdx := len(msgs) - 1
+		if msgs[lastIdx]["role"] == "user" {
+			if uBlocks, ok := msgs[lastIdx]["content"].([]map[string]any); ok && len(uBlocks) > 0 {
+				lastBlockText, _ := uBlocks[len(uBlocks)-1]["text"].(string)
+				var reminder string
+				if strings.Contains(lastBlockText, "<tool_result") {
+					reminder = "\n\n[Agent Continuation Rule: Analyze the tool result above. If the task is not yet finished, call the next tool immediately using <toolcall>. DO NOT pause or say you will do it without the toolcall. If completely finished, provide your final response as text.]"
+				} else {
+					reminder = "\n\n[Agent Action Rule: You have access to tools. If you need to search, execute commands, or inspect workspace/files to answer, call the appropriate tool immediately using <toolcall> block. DO NOT merely say you will do it (e.g. avoid '好的我来查', 'I will check') without emitting the <toolcall>.]"
+				}
+				uBlocks[len(uBlocks)-1]["text"] = lastBlockText + reminder
+				msgs[lastIdx]["content"] = uBlocks
+			}
+		}
+	}
+
 	return msgs, toolMap
 }
 
