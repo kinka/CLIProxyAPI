@@ -420,7 +420,19 @@ func FormatTraeMessagesWithTools(root gjson.Result) ([]map[string]any, map[strin
 				forName = mapped
 			}
 			resultText := contentVal.String()
-			wrapped := fmt.Sprintf("<tool_result for=\"%s\">\n%s\n</tool_result>", forName, resultText)
+			wrapped := fmt.Sprintf("<tool_result for=\"%s\" id=\"%s\">\n%s\n</tool_result>", forName, callID, resultText)
+
+			// Merge adjacent tool results into the same user message turn
+			if len(msgs) > 0 && msgs[len(msgs)-1]["role"] == "user" {
+				if prevBlocks, ok := msgs[len(msgs)-1]["content"].([]map[string]any); ok && len(prevBlocks) > 0 {
+					if prevText, hasText := prevBlocks[len(prevBlocks)-1]["text"].(string); hasText && strings.Contains(prevText, "<tool_result") {
+						prevBlocks[len(prevBlocks)-1]["text"] = prevText + "\n\n" + wrapped
+						msgs[len(msgs)-1]["content"] = prevBlocks
+						continue
+					}
+				}
+			}
+
 			msgs = append(msgs, map[string]any{
 				"role": "user",
 				"content": []map[string]any{
@@ -606,9 +618,14 @@ func FormatTraeMessagesWithTools(root gjson.Result) ([]map[string]any, map[strin
 				lastBlockText, _ := uBlocks[len(uBlocks)-1]["text"].(string)
 				var reminder string
 				if strings.Contains(lastBlockText, "<tool_result") {
-					reminder = "\n\n[Agent Continuation Rule: Analyze the tool result above. If the task is not yet finished, call the next tool immediately using <toolcall>. DO NOT pause or say you will do it without the toolcall. If completely finished, provide your final response as text.]"
+					reminder = "\n\n[Agent Continuation Rule / 连续执行硬约束:\n" +
+						"1. 分析上方工具执行结果。若任务未完全解决，必须在当前回答中立即使用 <toolcall> 格式调用下一个工具！\n" +
+						"2. 【严禁空头过渡】：严禁输出如“我找到了问题所在。让我进一步确认：”、“让我检查一下...”、“我来查看...”等过渡短句后直接停止！如果需要进一步确认或检查，必须在同一回复中直接输出 <toolcall>，绝对禁止以冒号结尾而无工具调用！\n" +
+						"3. 只有当排查和任务彻底完成且不再需要任何操作时，才输出最终文本总结。]"
 				} else {
-					reminder = "\n\n[Agent Action Rule: You have access to tools. If you need to search, execute commands, or inspect workspace/files to answer, call the appropriate tool immediately using <toolcall> block. DO NOT merely say you will do it (e.g. avoid '好的我来查', 'I will check') without emitting the <toolcall>.]"
+					reminder = "\n\n[Agent Action Rule / 行动硬约束:\n" +
+						"1. 你有权调用工具。如果需要查看文件、执行命令或排查代码，必须在当前回复中立即输出 <toolcall> 工具调用；\n" +
+						"2. 【严禁只说不做】：严禁仅输出“好的我来排查”、“让我看一下”、“稍等”等说明性文字后停下等待，必须直接输出 <toolcall>！]"
 				}
 				uBlocks[len(uBlocks)-1]["text"] = lastBlockText + reminder
 				msgs[lastIdx]["content"] = uBlocks
@@ -1451,4 +1468,120 @@ func (f *ToolCallStreamFilter) Flush() (string, []TraeToolCall) {
 // HasEmittedCalls returns whether any tool calls were emitted by this filter.
 func (f *ToolCallStreamFilter) HasEmittedCalls() bool {
 	return len(f.emittedCalls) > 0
+}
+
+// IsTransitionalDeferralText checks whether a text response from the model is merely an
+// introductory conversational promise or deferral (e.g. "我找到了问题所在。让我进一步确认：",
+// "让我检查一下...", "Let me check...") without emitting any tool call or final answer.
+func IsTransitionalDeferralText(text string) bool {
+	trimmed := strings.TrimSpace(text)
+	if trimmed == "" {
+		return false
+	}
+	runes := []rune(trimmed)
+	if len(runes) > 150 {
+		return false
+	}
+
+	// If the text contains substantive solution or conclusion keywords, it is not a deferral.
+	substantiveKeywords := []string{
+		"修复方法", "解决方案", "修改建议", "解决方法", "修复如下",
+		"总结如下", "排查结论", "最终结论", "参考代码", "代码如下",
+	}
+	for _, kw := range substantiveKeywords {
+		if strings.Contains(trimmed, kw) {
+			return false
+		}
+	}
+
+	lower := strings.ToLower(trimmed)
+
+	// Check for ending colon (standard introductory indicator in Chinese/English)
+	hasColonSuffix := strings.HasSuffix(trimmed, "：") || strings.HasSuffix(trimmed, ":")
+
+	transitionalPhrases := []string{
+		"让我进一步", "让我检查", "让我查看", "让我排查", "让我确认",
+		"让我看一下", "让我看下", "让我分析", "让我运行", "让我执行",
+		"我来进一步", "我来检查", "我来查看", "我来排查", "我来确认",
+		"我来看一下", "我来看下", "我来分析", "我来运行", "我来执行",
+		"接下来我将", "接下来我会", "接下来进行", "下面我将", "下面我会",
+		"稍等，我", "稍等我", "我先检查", "我先查看", "我先确认",
+		"正在排查", "正在检查", "正在查看",
+		"问题所在。让我", "问题所在，让我", "找到原因。让我", "找到原因，让我",
+		"进一步排查", "进一步确认", "进一步检查", "进一步查看",
+		"let me check", "let me inspect", "let me verify", "let me examine",
+		"let me see", "let me look", "i will check", "i will inspect",
+		"i will verify", "i will examine", "i will look",
+	}
+
+	// Extract the last clause
+	parts := strings.FieldsFunc(trimmed, func(r rune) bool {
+		return r == '。' || r == '！' || r == '!' || r == '？' || r == '?' || r == '\n'
+	})
+	lastClause := trimmed
+	if len(parts) > 0 {
+		lastClause = strings.TrimSpace(parts[len(parts)-1])
+	}
+	lowerLast := strings.ToLower(lastClause)
+
+	hasTransitionalInLastClause := false
+	for _, p := range transitionalPhrases {
+		if strings.Contains(lowerLast, strings.ToLower(p)) {
+			hasTransitionalInLastClause = true
+			break
+		}
+	}
+
+	hasTransitionalOverall := false
+	for _, p := range transitionalPhrases {
+		if strings.Contains(lower, strings.ToLower(p)) {
+			hasTransitionalOverall = true
+			break
+		}
+	}
+
+	if hasColonSuffix {
+		// If ending with a colon, the final clause must be transitional
+		return hasTransitionalInLastClause
+	}
+
+	if hasTransitionalOverall {
+		if len(runes) < 60 {
+			return true
+		}
+		if strings.HasSuffix(trimmed, "...") || strings.HasSuffix(trimmed, "。。。") ||
+			strings.HasSuffix(trimmed, "一下") || strings.HasSuffix(trimmed, "看看") {
+			return true
+		}
+	}
+
+	return false
+}
+
+// AppendMessagesToPayload appends one or more messages to an OpenAI chat payload.
+func AppendMessagesToPayload(rawPayload []byte, extraMsgs ...map[string]any) ([]byte, error) {
+	if len(extraMsgs) == 0 {
+		return rawPayload, nil
+	}
+	root := gjson.ParseBytes(rawPayload)
+	var outMap map[string]any
+	if err := json.Unmarshal(rawPayload, &outMap); err != nil {
+		outMap = make(map[string]any)
+	}
+
+	var msgs []any
+	if existing, ok := outMap["messages"].([]any); ok {
+		msgs = existing
+	} else if rawMsgs := root.Get("messages"); rawMsgs.Exists() && rawMsgs.IsArray() {
+		for _, m := range rawMsgs.Array() {
+			msgs = append(msgs, m.Value())
+		}
+	}
+
+	for _, em := range extraMsgs {
+		msgs = append(msgs, em)
+	}
+	outMap["messages"] = msgs
+
+	return json.Marshal(outMap)
 }

@@ -352,6 +352,8 @@ func (e *TraeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 
 	var lastErr error
 	var httpResp *http.Response
+	var chosenPlan traeEndpointPlan
+	var chosenURL string
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 	var lastUsage *helps.TraeTokenUsage
@@ -468,6 +470,8 @@ func (e *TraeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 		}
 
 		httpResp = respDo
+		chosenPlan = plan
+		chosenURL = url
 		break
 	}
 
@@ -486,6 +490,45 @@ func (e *TraeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	cleanContent := fullContent.String()
 	if len(toolCalls) > 0 {
 		cleanContent = helps.StripToolCallsFromText(cleanContent)
+	} else if helps.IsTransitionalDeferralText(strings.TrimSpace(cleanContent)) {
+		// Auto-drive turn for conversational deferral in non-streaming mode
+		accumulatedText := strings.TrimSpace(cleanContent)
+		prompt := fmt.Sprintf("【Agent Action Rule: You stated: %q. DO NOT merely explain or pause. Call the next tool immediately using <toolcall> to execute your action now.】", accumulatedText)
+		if newPayload, errAppend := helps.AppendMessagesToPayload(openAIPayload,
+			map[string]any{"role": "assistant", "content": accumulatedText},
+			map[string]any{"role": "user", "content": prompt},
+		); errAppend == nil {
+			if newTraeBody, _, errNewBuild := chosenPlan.buildBody(newPayload, baseModel, storage, false); errNewBuild == nil {
+				if newReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, chosenURL, bytes.NewReader(newTraeBody)); errNewReq == nil {
+					helps.ApplyTraeHeaders(newReq, storage, false)
+					if chosenPlan.isRaw {
+						newReq.Header.Set("X-App-Function", "solo_agent")
+						newReq.Header.Set("X-Ide-Function", "solo_agent")
+					}
+					if auth != nil {
+						util.ApplyCustomHeadersFromAttrs(newReq, auth.Attributes)
+					}
+					if newResp, errNewDo := httpClient.Do(newReq); errNewDo == nil && newResp.StatusCode >= 200 && newResp.StatusCode < 300 {
+						defer newResp.Body.Close()
+						var secondContent strings.Builder
+						scanner2 := bufio.NewScanner(newResp.Body)
+						scanner2.Buffer(nil, 1048576)
+						var ev2 string
+						for scanner2.Scan() {
+							line := scanner2.Text()
+							p := helps.ParseTraeSSELine(line, &ev2)
+							if p != nil && p.Type == "text" && p.Content != "" {
+								secondContent.WriteString(p.Content)
+							}
+						}
+						if moreCalls := helps.ExtractToolCallsFromText(secondContent.String(), toolMap); len(moreCalls) > 0 {
+							toolCalls = append(toolCalls, moreCalls...)
+							cleanContent = cleanContent + "\n" + helps.StripToolCallsFromText(secondContent.String())
+						}
+					}
+				}
+			}
+		}
 	}
 	openAIRespJSON := helps.FormatOpenAINonStreamResponseWithTools(compID, req.Model, cleanContent, fullReasoning.String(), toolCalls, lastUsage)
 
@@ -530,6 +573,8 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	var streamBody io.ReadCloser
 	var lastErr error
 	var activeResp *http.Response
+	var chosenPlan traeEndpointPlan
+	var chosenURL string
 
 	for i, plan := range plans {
 		traeBody, _, errBuild := plan.buildBody(openAIPayload, baseModel, storage, true)
@@ -607,6 +652,8 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		}
 
 		streamBody = peekedBody
+		chosenPlan = plan
+		chosenURL = url
 		activeResp = httpResp
 		break
 	}
@@ -623,13 +670,17 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 	go func() {
 		defer close(out)
+		currentStreamBody := streamBody
 		defer func() {
-			if errClose := streamBody.Close(); errClose != nil {
-				log.Errorf("trae executor: close stream body error: %v", errClose)
+			if currentStreamBody != nil {
+				if errClose := currentStreamBody.Close(); errClose != nil {
+					log.Errorf("trae executor: close stream body error: %v", errClose)
+				}
 			}
 		}()
 
-		scanner := bufio.NewScanner(streamBody)
+		currentPayload := openAIPayload
+		scanner := bufio.NewScanner(currentStreamBody)
 		scanner.Buffer(nil, 1048576)
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var currentEvent string
@@ -637,8 +688,11 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		var streamUsage helps.StreamUsageBuffer
 		defer streamUsage.Publish(ctx, reporter)
 
-		toolMap := helps.ExtractToolMapFromPayload(openAIPayload, originalPayload)
+		toolMap := helps.ExtractToolMapFromPayload(currentPayload, originalPayload)
 		toolFilter := helps.NewToolCallStreamFilter(toolMap)
+		var fullAssistantContent strings.Builder
+		autoDriveCount := 0
+		const maxAutoDrive = 2
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -668,11 +722,12 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				if parsed.Content != "" {
 					cleanText, newCalls := toolFilter.Feed(parsed.Content)
 					if cleanText != "" {
+						fullAssistantContent.WriteString(cleanText)
 						chunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, cleanText, "", "")
 						lineChunk := append([]byte("data: "), chunkJSON...)
 						lineChunk = append(lineChunk, []byte("\n\n")...)
 
-						chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+						chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, currentPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
 						for i := range chunks {
 							select {
 							case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -688,7 +743,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 							lineChunk := append([]byte("data: "), tcChunkJSON...)
 							lineChunk = append(lineChunk, []byte("\n\n")...)
 
-							chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+							chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, currentPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
 							for i := range chunks {
 								select {
 								case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -726,11 +781,12 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			} else if parsed.Type == "done" {
 				flushText, finalCalls := toolFilter.Flush()
 				if flushText != "" {
+					fullAssistantContent.WriteString(flushText)
 					chunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, flushText, "", "")
 					lineChunk := append([]byte("data: "), chunkJSON...)
 					lineChunk = append(lineChunk, []byte("\n\n")...)
 
-					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, currentPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
 					for i := range chunks {
 						select {
 						case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -746,12 +802,57 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 						lineChunk := append([]byte("data: "), tcChunkJSON...)
 						lineChunk = append(lineChunk, []byte("\n\n")...)
 
-						chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+						chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, currentPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
 						for i := range chunks {
 							select {
 							case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
 							case <-ctx.Done():
 								return
+							}
+						}
+					}
+				}
+
+				// Auto-drive check: if turn ended with an introductory deferral phrase and zero tool calls,
+				// prompt the model to call the tool immediately within the same turn.
+				hasEmittedCalls := toolFilter.HasEmittedCalls() || len(finalCalls) > 0
+				accumulatedText := strings.TrimSpace(fullAssistantContent.String())
+				if !hasEmittedCalls && helps.IsTransitionalDeferralText(accumulatedText) && autoDriveCount < maxAutoDrive {
+					autoDriveCount++
+					log.Infof("trae executor stream: detected transitional deferral %q with no tool call, auto-driving (attempt %d/%d)", accumulatedText, autoDriveCount, maxAutoDrive)
+
+					prompt := fmt.Sprintf("【Agent Action Rule: You stated: %q. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】", accumulatedText)
+					newPayload, errAppend := helps.AppendMessagesToPayload(currentPayload,
+						map[string]any{"role": "assistant", "content": accumulatedText},
+						map[string]any{"role": "user", "content": prompt},
+					)
+					if errAppend == nil {
+						newTraeBody, _, errNewBuild := chosenPlan.buildBody(newPayload, baseModel, storage, true)
+						if errNewBuild == nil {
+							newReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, chosenURL, bytes.NewReader(newTraeBody))
+							if errNewReq == nil {
+								helps.ApplyTraeHeaders(newReq, storage, true)
+								if chosenPlan.isRaw {
+									newReq.Header.Set("X-App-Function", "solo_agent")
+									newReq.Header.Set("X-Ide-Function", "solo_agent")
+								}
+								if auth != nil {
+									util.ApplyCustomHeadersFromAttrs(newReq, auth.Attributes)
+								}
+								newResp, errNewDo := httpClient.Do(newReq)
+								if errNewDo == nil && newResp.StatusCode >= 200 && newResp.StatusCode < 300 {
+									newPeeked, peekErr, errPeek := peekFirstTraeEvent(newResp)
+									if errPeek == nil && peekErr == nil {
+										_ = currentStreamBody.Close()
+										currentStreamBody = newPeeked
+										scanner = bufio.NewScanner(currentStreamBody)
+										scanner.Buffer(nil, 1048576)
+										currentPayload = newPayload
+										currentEvent = ""
+										fullAssistantContent.Reset()
+										continue
+									}
+								}
 							}
 						}
 					}
@@ -768,7 +869,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				lineChunk := append([]byte("data: "), doneChunkJSON...)
 				lineChunk = append(lineChunk, []byte("\n\n")...)
 
-				chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+				chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, currentPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
 				for i := range chunks {
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
@@ -778,7 +879,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				}
 
 				// Terminal [DONE]
-				doneChunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, []byte("data: [DONE]\n\n"), &param, claudeInputTokens)
+				doneChunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, currentPayload, []byte("data: [DONE]\n\n"), &param, claudeInputTokens)
 				for i := range doneChunks {
 					select {
 					case out <- cliproxyexecutor.StreamChunk{Payload: doneChunks[i]}:

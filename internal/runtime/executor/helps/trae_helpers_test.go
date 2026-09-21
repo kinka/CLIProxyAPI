@@ -334,3 +334,104 @@ func TestToolCallStreamFilterDSML(t *testing.T) {
 		t.Fatalf("missing normal text in output: %s", outText)
 	}
 }
+
+func TestIsTransitionalDeferralText(t *testing.T) {
+	cases := []struct {
+		text     string
+		expected bool
+	}{
+		{"我找到了问题所在。让我进一步确认：", true},
+		{"让我检查一下 gemini/antigravity 的实际采集逻辑，看看为什么额度一直没更新：", true},
+		{"我来查看一下当前目录下的文件：", true},
+		{"我先检查一下配额配置：", true},
+		{"Let me check the status:", true},
+		{"Let me examine the logs:", true},
+		{"I will check the configuration:", true},
+		{"排查完成。问题原因是由于 token 已经过期，重新刷新后即可正常使用。", false},
+		{"Here is the final summary of the issue.", false},
+		{"让我检查一下代码。这里发现了一个语法错误：在第 45 行缺少分号。修复方法如下：", false},
+	}
+
+	for _, c := range cases {
+		got := helps.IsTransitionalDeferralText(c.text)
+		if got != c.expected {
+			t.Errorf("IsTransitionalDeferralText(%q) = %v, expected %v", c.text, got, c.expected)
+		}
+	}
+}
+
+func TestAppendMessagesToPayload(t *testing.T) {
+	raw := []byte(`{"model":"glm-5.2","messages":[{"role":"user","content":"hello"}]}`)
+	extra1 := map[string]any{"role": "assistant", "content": "Let me check:"}
+	extra2 := map[string]any{"role": "user", "content": "Please run the tool."}
+
+	updated, err := helps.AppendMessagesToPayload(raw, extra1, extra2)
+	if err != nil {
+		t.Fatalf("AppendMessagesToPayload failed: %v", err)
+	}
+
+	parsed := gjson.ParseBytes(updated)
+	msgs := parsed.Get("messages").Array()
+	if len(msgs) != 3 {
+		t.Fatalf("expected 3 messages, got %d", len(msgs))
+	}
+	if msgs[1].Get("role").String() != "assistant" || msgs[1].Get("content").String() != "Let me check:" {
+		t.Errorf("unexpected message 1: %s", msgs[1].Raw)
+	}
+	if msgs[2].Get("role").String() != "user" || msgs[2].Get("content").String() != "Please run the tool." {
+		t.Errorf("unexpected message 2: %s", msgs[2].Raw)
+	}
+}
+
+func TestFormatTraeMessagesWithTools_ParallelResults(t *testing.T) {
+	payloadJSON := `{
+		"messages": [
+			{"role": "user", "content": "check everything"},
+			{
+				"role": "assistant",
+				"content": "Checking files and processes",
+				"tool_calls": [
+					{"id": "call_1", "type": "function", "function": {"name": "Bash", "arguments": "{\"command\":\"ls\"}"}},
+					{"id": "call_2", "type": "function", "function": {"name": "Bash", "arguments": "{\"command\":\"ps\"}"}}
+				]
+			},
+			{"role": "tool", "tool_call_id": "call_1", "content": "file.txt"},
+			{"role": "tool", "tool_call_id": "call_2", "content": "pid 123"}
+		],
+		"tools": [
+			{
+				"type": "function",
+				"function": {"name": "Bash", "description": "Execute bash command"}
+			}
+		]
+	}`
+
+	root := gjson.Parse(payloadJSON)
+	messages, _ := helps.FormatTraeMessagesWithTools(root)
+
+	// sys (1) + user (1) + assistant (1) + merged tool_results (1) = 4
+	if len(messages) != 4 {
+		t.Fatalf("expected 4 messages after merging tool results, got %d", len(messages))
+	}
+
+	lastMsg := messages[len(messages)-1]
+	if lastMsg["role"] != "user" {
+		t.Fatalf("expected role user for merged tool results, got %s", lastMsg["role"])
+	}
+
+	blocks, ok := lastMsg["content"].([]map[string]any)
+	if !ok || len(blocks) == 0 {
+		t.Fatalf("expected content blocks in merged tool result")
+	}
+
+	txt := blocks[0]["text"].(string)
+	if !strings.Contains(txt, `<tool_result for="Bash" id="call_1">`) {
+		t.Errorf("expected call_1 result in merged text: %s", txt)
+	}
+	if !strings.Contains(txt, `<tool_result for="Bash" id="call_2">`) {
+		t.Errorf("expected call_2 result in merged text: %s", txt)
+	}
+	if !strings.Contains(txt, "Agent Continuation Rule") {
+		t.Errorf("expected continuation rule reminder in last message: %s", txt)
+	}
+}
