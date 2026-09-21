@@ -817,16 +817,16 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				// prompt the model to call the tool immediately within the same turn.
 				hasEmittedCalls := toolFilter.HasEmittedCalls() || len(finalCalls) > 0
 				accumulatedText := strings.TrimSpace(fullAssistantContent.String())
-				// An earlier drive that came back with no content at all would otherwise fall
-				// through to end_turn and stall the agent loop, so keep driving in that case too.
-				emptyContinuation := accumulatedText == "" && autoDriveCount > 0
+				// A turn with no content at all would otherwise fall through to end_turn and
+				// stall the agent loop, so drive it the same way a deferral is driven.
+				emptyTurn := accumulatedText == ""
 				needsAutoDrive := !hasEmittedCalls && autoDriveCount < maxAutoDrive &&
-					(emptyContinuation || helps.IsTransitionalDeferralText(accumulatedText))
+					(emptyTurn || helps.IsTransitionalDeferralText(accumulatedText))
 				if needsAutoDrive {
 					autoDriveCount++
 					var prompt string
-					if emptyContinuation {
-						log.Infof("trae executor stream: continuation returned no content and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
+					if emptyTurn {
+						log.Infof("trae executor stream: turn produced no content and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
 						prompt = "【Agent Action Rule: Your previous reply was empty. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】"
 					} else {
 						log.Infof("trae executor stream: detected transitional deferral %q with no tool call, auto-driving (attempt %d/%d)", accumulatedText, autoDriveCount, maxAutoDrive)

@@ -697,3 +697,20 @@ func TestTraeAutoDriveRetriesWhenContinuationIsEmpty(t *testing.T) {
 		t.Errorf("expected stop_reason tool_use after second auto-drive, got:\n%s", sse)
 	}
 }
+
+// An upstream turn that yields nothing at all must be driven too: Claude Code
+// renders an empty end_turn response as a dead "No response requested." turn.
+func TestTraeAutoDriveRecoversEmptyFirstTurn(t *testing.T) {
+	var hits int32
+	server := traeAutoDriveServer(t, [][]string{traeEmptyScript, traeToolCallScript}, &hits)
+	defer server.Close()
+
+	sse := traeAutoDriveClaudeStream(t, server.URL)
+
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("expected 2 upstream requests (empty original + auto-drive), got %d", got)
+	}
+	if !strings.Contains(sse, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason tool_use after driving an empty turn, got:\n%s", sse)
+	}
+}
