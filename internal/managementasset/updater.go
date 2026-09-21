@@ -1,6 +1,7 @@
 package managementasset
 
 import (
+	"bytes"
 	"context"
 	"crypto/sha256"
 	"encoding/hex"
@@ -277,6 +278,13 @@ func EnsureLatestManagementHTML(ctx context.Context, staticDir string, proxyURL 
 			return nil, nil
 		}
 
+		if !localFileMissing {
+			if localData, readErr := os.ReadFile(localPath); readErr == nil && bytes.Contains(localData, []byte("trae_oauth_title")) && !bytes.Contains(data, []byte("trae_oauth_title")) {
+				log.Debug("keeping customized management asset with trae oauth support")
+				return nil, nil
+			}
+		}
+
 		if err = atomicWriteFile(localPath, data); err != nil {
 			log.WithError(err).Warn("failed to update management asset on disk")
 			return nil, nil
@@ -299,6 +307,11 @@ func ensureFallbackManagementHTML(ctx context.Context, client *http.Client, loca
 
 	log.Warnf("management asset downloaded from fallback URL without digest verification (hash=%s) — "+
 		"enable verified GitHub updates by keeping disable-auto-update-panel set to false", downloadedHash)
+
+	if localData, readErr := os.ReadFile(localPath); readErr == nil && bytes.Contains(localData, []byte("trae_oauth_title")) && !bytes.Contains(data, []byte("trae_oauth_title")) {
+		log.Debug("keeping customized management asset with trae oauth support over fallback")
+		return true
+	}
 
 	if err = atomicWriteFile(localPath, data); err != nil {
 		log.WithError(err).Warn("failed to persist fallback management control panel page")
