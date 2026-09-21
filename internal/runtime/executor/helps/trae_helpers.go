@@ -993,6 +993,26 @@ var (
 // holding a fragment such as `{"name":"Bash","index":1,"argument`. Emitting that
 // as a tool call makes the client answer "No such tool available" and kills the
 // turn, so reject anything that is not shaped like an identifier.
+// soleToolName returns the only tool the map resolves to, or "" when the request
+// declared none or more than one. BuildToolMap registers several aliases per
+// tool, so the distinct values have to be counted rather than the keys.
+func soleToolName(toolMap map[string]string) string {
+	only := ""
+	for _, name := range toolMap {
+		if name == "" {
+			continue
+		}
+		if only == "" {
+			only = name
+			continue
+		}
+		if name != only {
+			return ""
+		}
+	}
+	return only
+}
+
 func isPlausibleToolName(name string) bool {
 	if name == "" || len(name) > 64 {
 		return false
@@ -1123,13 +1143,13 @@ func ParseToolcallContent(inner string, toolMap map[string]string) (TraeToolCall
 		for _, m := range matchesParam {
 			params[m[1]] = strings.TrimSpace(m[2])
 		}
-		if name != "" || len(params) > 0 {
-			if name == "" && toolMap != nil {
-				for _, origName := range toolMap {
-					name = origName
-					break
-				}
-			}
+		if name == "" {
+			// No tool name in the text. Guessing is only safe when the request
+			// declared a single tool; with a full tool set there is nothing to
+			// infer from, and picking an arbitrary entry would call a random tool.
+			name = soleToolName(toolMap)
+		}
+		if name != "" {
 			return buildToolCall(name, params, toolMap), true
 		}
 	}

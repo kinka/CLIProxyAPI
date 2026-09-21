@@ -477,3 +477,38 @@ func TestParseToolcallContentStillRecoversAttributeStyle(t *testing.T) {
 		t.Errorf("expected command argument, got %s", tc.Args)
 	}
 }
+
+// A <param name="..."> block with no tool name used to fall back to whatever the
+// toolMap yielded first, which in Go is a random entry — so a nameless fragment
+// could invoke an arbitrary tool. With a full tool set there is nothing to infer
+// from, so it must be rejected.
+func TestParseToolcallContentRejectsNamelessParamsWithMultipleTools(t *testing.T) {
+	toolMap := map[string]string{
+		"bash": "Bash", "Bash": "Bash",
+		"read": "Read", "Read": "Read",
+		"write": "Write", "Write": "Write",
+	}
+	// Run repeatedly: the old fallback depended on map iteration order, so a
+	// single pass could pass by luck.
+	for i := 0; i < 50; i++ {
+		if tc, ok := helps.ParseToolcallContent(`<param name="command">rm -rf /tmp/x</param>`, toolMap); ok {
+			t.Fatalf("nameless params resolved to tool %q with args %s", tc.Name, tc.Args)
+		}
+	}
+}
+
+// When the request declared exactly one tool there is only one thing the call
+// can mean, so the nameless form still resolves — deterministically.
+func TestParseToolcallContentResolvesNamelessParamsWithSoleTool(t *testing.T) {
+	toolMap := map[string]string{"bash": "Bash", "Bash": "Bash", "execute_command": "Bash"}
+	tc, ok := helps.ParseToolcallContent(`<param name="command">ls -la</param>`, toolMap)
+	if !ok {
+		t.Fatal("nameless params with a sole declared tool were rejected")
+	}
+	if tc.Name != "Bash" {
+		t.Errorf("expected name Bash, got %q", tc.Name)
+	}
+	if !strings.Contains(tc.Args, "ls -la") {
+		t.Errorf("expected command argument, got %s", tc.Args)
+	}
+}
