@@ -414,9 +414,10 @@ func normalizeOAuthCallbackProviderForPendingSession(provider, state string) (st
 }
 
 type oauthCallbackFilePayload struct {
-	Code  string `json:"code"`
-	State string `json:"state"`
-	Error string `json:"error"`
+	Code        string `json:"code"`
+	State       string `json:"state"`
+	Error       string `json:"error"`
+	RawCallback string `json:"raw_callback,omitempty"`
 }
 
 func WriteOAuthCallbackFile(authDir, provider, state, code, errorMessage string) (string, error) {
@@ -424,10 +425,14 @@ func WriteOAuthCallbackFile(authDir, provider, state, code, errorMessage string)
 	if err != nil {
 		return "", err
 	}
-	return writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessage)
+	return writeOAuthCallbackFileWithRaw(authDir, canonicalProvider, state, code, errorMessage, "")
 }
 
 func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessage string) (string, error) {
+	return writeOAuthCallbackFileWithRaw(authDir, canonicalProvider, state, code, errorMessage, "")
+}
+
+func writeOAuthCallbackFileWithRaw(authDir, canonicalProvider, state, code, errorMessage, rawCallback string) (string, error) {
 	if strings.TrimSpace(authDir) == "" {
 		return "", fmt.Errorf("auth dir is empty")
 	}
@@ -445,9 +450,10 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 		return "", fmt.Errorf("create oauth callback dir: %w", err)
 	}
 	payload := oauthCallbackFilePayload{
-		Code:  strings.TrimSpace(code),
-		State: strings.TrimSpace(state),
-		Error: strings.TrimSpace(errorMessage),
+		Code:        strings.TrimSpace(code),
+		State:       strings.TrimSpace(state),
+		Error:       strings.TrimSpace(errorMessage),
+		RawCallback: strings.TrimSpace(rawCallback),
 	}
 	data, err := json.Marshal(payload)
 	if err != nil {
@@ -479,6 +485,10 @@ func writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessag
 }
 
 func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, errorMessage string) (string, error) {
+	return WriteOAuthCallbackFileWithRawForPendingSession(authDir, provider, state, code, errorMessage, "")
+}
+
+func WriteOAuthCallbackFileWithRawForPendingSession(authDir, provider, state, code, errorMessage, rawCallback string) (string, error) {
 	canonicalProvider, err := normalizeOAuthCallbackProviderForPendingSession(provider, state)
 	if err != nil {
 		return "", err
@@ -486,5 +496,5 @@ func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, err
 	if !IsOAuthSessionPending(state, canonicalProvider) {
 		return "", errOAuthSessionNotPending
 	}
-	return writeOAuthCallbackFile(authDir, canonicalProvider, state, code, errorMessage)
+	return writeOAuthCallbackFileWithRaw(authDir, canonicalProvider, state, code, errorMessage, rawCallback)
 }

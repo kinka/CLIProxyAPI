@@ -388,6 +388,161 @@ func ExchangeTokenByAuthCode(
 	}, nil
 }
 
+// ParseEnterpriseCallback parses the callback URL or query string from Trae Enterprise authorization
+// and constructs a ready-to-use TraeTokenStorage. If userJwt is not present, it returns nil, nil.
+func ParseEnterpriseCallback(rawInput string, fallbackMachineID, fallbackDeviceID string) (*TraeTokenStorage, error) {
+	rawInput = strings.TrimSpace(rawInput)
+	if rawInput == "" {
+		return nil, nil
+	}
+
+	var values url.Values
+	if strings.Contains(rawInput, "?") {
+		u, err := url.Parse(rawInput)
+		if err != nil {
+			return nil, fmt.Errorf("trae: failed to parse callback url: %w", err)
+		}
+		values = u.Query()
+	} else if strings.Contains(rawInput, "=") {
+		var err error
+		values, err = url.ParseQuery(rawInput)
+		if err != nil {
+			return nil, fmt.Errorf("trae: failed to parse callback query: %w", err)
+		}
+	} else {
+		return nil, nil
+	}
+
+	userJwtRaw := strings.TrimSpace(values.Get("userJwt"))
+	if userJwtRaw == "" {
+		return nil, nil
+	}
+
+	var userJwt struct {
+		RefreshToken        string `json:"RefreshToken"`
+		RefreshExpireAt     int64  `json:"RefreshExpireAt"`
+		Token               string `json:"Token"`
+		TokenExpireAt       int64  `json:"TokenExpireAt"`
+		TokenExpireDuration int64  `json:"TokenExpireDuration"`
+	}
+	if err := json.Unmarshal([]byte(userJwtRaw), &userJwt); err != nil {
+		return nil, fmt.Errorf("trae: failed to parse userJwt JSON: %w", err)
+	}
+
+	accessToken := strings.TrimSpace(userJwt.Token)
+	if accessToken == "" {
+		return nil, fmt.Errorf("trae: userJwt missing Token")
+	}
+
+	refreshToken := strings.TrimSpace(userJwt.RefreshToken)
+	if refreshToken == "" {
+		refreshToken = strings.TrimSpace(firstNonEmpty(values.Get("refreshToken"), values.Get("data")))
+	}
+
+	var expiredStr string
+	if userJwt.TokenExpireAt > 0 {
+		expiredStr = time.UnixMilli(userJwt.TokenExpireAt).UTC().Format(time.RFC3339)
+	}
+	var refreshExpiredStr string
+	if userJwt.RefreshExpireAt > 0 {
+		refreshExpiredStr = time.UnixMilli(userJwt.RefreshExpireAt).UTC().Format(time.RFC3339)
+	}
+
+	host := strings.TrimSpace(firstNonEmpty(values.Get("host"), values.Get("consoleHost"), values.Get("coreHost"), "https://console.enterprise.trae.cn"))
+	host = strings.TrimRight(host, "/")
+
+	accountMap := make(map[string]any)
+	accountMap["scope"] = firstNonEmpty(values.Get("scope"), "saas")
+	accountMap["loginScope"] = firstNonEmpty(values.Get("scope"), "saas")
+	accountMap["saas_privacy_mode"] = "on"
+	accountMap["saas_product_type"] = 231
+	accountMap["storeRegion"] = "CN"
+	accountMap["userTag"] = "cn"
+
+	saasBootConfig := map[string]any{
+		"apiHost":     host,
+		"consoleHost": host,
+		"remoteApi":   "https://work.enterprise.trae.cn",
+		"soloDomain":  "https://work.enterprise.trae.cn",
+		"soloPushConfig": map[string]any{
+			"channel": "ws",
+		},
+	}
+
+	if dfRaw := values.Get("datafinderConfig"); dfRaw != "" {
+		var dfMap map[string]any
+		if err := json.Unmarshal([]byte(dfRaw), &dfMap); err == nil {
+			saasBootConfig["dataFinder"] = dfMap
+		}
+	}
+	if apmRaw := values.Get("apmPlusConfig"); apmRaw != "" {
+		var apmMap map[string]any
+		if err := json.Unmarshal([]byte(apmRaw), &apmMap); err == nil {
+			saasBootConfig["apmPlus"] = apmMap
+		}
+	}
+	accountMap["saasBootConfig"] = saasBootConfig
+
+	var userID string
+	if uInfoRaw := values.Get("userInfo"); uInfoRaw != "" {
+		var uInfoMap map[string]any
+		if err := json.Unmarshal([]byte(uInfoRaw), &uInfoMap); err == nil {
+			accountMap["rawUserInfo"] = uInfoMap
+			if uObj, ok := uInfoMap["UserInfo"].(map[string]any); ok {
+				if uid, ok := uObj["UserID"].(string); ok && uid != "" {
+					userID = uid
+				}
+				if uname, ok := uObj["Name"].(string); ok && uname != "" {
+					accountMap["username"] = uname
+				}
+				if email, ok := uObj["Email"].(string); ok && email != "" {
+					accountMap["email"] = email
+				}
+				if tid, ok := uObj["TenantID"].(string); ok && tid != "" {
+					accountMap["tenant_id"] = tid
+				}
+				if rID, ok := uObj["RoleID"].(float64); ok {
+					accountMap["roleId"] = int(rID)
+				}
+			}
+			if tObj, ok := uInfoMap["TenantInfoBase"].(map[string]any); ok {
+				if tName, ok := tObj["TenantName"].(string); ok && tName != "" {
+					accountMap["tenant_name"] = tName
+				}
+				if tidNum, ok := tObj["TenantID"].(float64); ok && accountMap["tenant_id"] == nil {
+					accountMap["tenant_id"] = fmt.Sprintf("%.0f", tidNum)
+				}
+			}
+		}
+	}
+
+	machineID := fallbackMachineID
+	if machineID == "" {
+		machineID = uuid.New().String()
+	}
+	deviceID := fallbackDeviceID
+	if deviceID == "" {
+		deviceID = HashDeviceID(machineID)
+	}
+
+	return &TraeTokenStorage{
+		AccessToken:    accessToken,
+		RefreshToken:   refreshToken,
+		TokenType:      "Cloud-IDE-JWT",
+		Expired:        expiredStr,
+		RefreshExpired: refreshExpiredStr,
+		DeviceID:       deviceID,
+		MachineID:      machineID,
+		UserID:         userID,
+		Edition:        "enterprise",
+		Host:           host,
+		AuthHost:       host,
+		UserRegion:     "CN",
+		Account:        accountMap,
+		Type:           "trae",
+	}, nil
+}
+
 // GetUserInfo fetches current user info from Trae API.
 func GetUserInfo(ctx context.Context, httpClient *http.Client, apiHost string, accessToken string) (map[string]any, error) {
 	if strings.TrimSpace(accessToken) == "" {
@@ -438,9 +593,10 @@ func GetUserInfo(ctx context.Context, httpClient *http.Client, apiHost string, a
 
 // TraeOAuthResult contains the authorization code result from the loopback server.
 type TraeOAuthResult struct {
-	Code  string
-	State string
-	Error string
+	Code   string
+	State  string
+	Error  string
+	RawURL string
 }
 
 // TraeOAuthServer provides a local HTTP server to receive the Trae OAuth authorization callback.
@@ -550,22 +706,25 @@ func (s *TraeOAuthServer) handleCallback(w http.ResponseWriter, r *http.Request)
 			}
 		}
 	}
+	if code == "" && q.Get("userJwt") != "" {
+		code = "trae-enterprise-jwt"
+	}
 	state := strings.TrimSpace(firstNonEmpty(q.Get("state"), q.Get("loginTraceID"), q.Get("login_trace_id")))
 	errStr := strings.TrimSpace(firstNonEmpty(q.Get("error"), q.Get("error_msg"), q.Get("error_description")))
 
 	if errStr != "" {
-		s.resultChan <- &TraeOAuthResult{Error: errStr, State: state}
+		s.resultChan <- &TraeOAuthResult{Error: errStr, State: state, RawURL: r.URL.String()}
 		http.Error(w, fmt.Sprintf("OAuth authorization error: %s", errStr), http.StatusBadRequest)
 		return
 	}
 
 	if code == "" {
-		s.resultChan <- &TraeOAuthResult{Error: "no_authorization_code", State: state}
+		s.resultChan <- &TraeOAuthResult{Error: "no_authorization_code", State: state, RawURL: r.URL.String()}
 		http.Error(w, "No authorization code found in callback", http.StatusBadRequest)
 		return
 	}
 
-	s.resultChan <- &TraeOAuthResult{Code: code, State: state}
+	s.resultChan <- &TraeOAuthResult{Code: code, State: state, RawURL: r.URL.String()}
 
 	w.Header().Set("Content-Type", "text/html; charset=utf-8")
 	w.WriteHeader(http.StatusOK)

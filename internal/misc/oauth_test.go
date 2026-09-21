@@ -36,4 +36,17 @@ func TestParseOAuthCallback(t *testing.T) {
 	if cbDirect.Code != "trae-direct-code" || cbDirect.State != "trace-777" {
 		t.Errorf("expected trae-direct-code/trace-777, got code=%s, state=%s", cbDirect.Code, cbDirect.State)
 	}
+
+	// 4. Trae Enterprise format with userJwt & loginTraceID
+	traeEntURL := "http://127.0.0.1:8317/authorize?scope=saas&loginTraceID=trace-ent-123&userJwt=%7B%22Token%22%3A%22jwt-token%22%7D"
+	cbEnt, err := ParseOAuthCallback(traeEntURL)
+	if err != nil {
+		t.Fatalf("unexpected error parsing enterprise callback: %v", err)
+	}
+	if cbEnt.State != "trace-ent-123" {
+		t.Errorf("expected state trace-ent-123, got %s", cbEnt.State)
+	}
+	if cbEnt.Code == "" {
+		t.Errorf("expected non-empty code for enterprise callback")
+	}
 }

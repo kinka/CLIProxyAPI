@@ -94,6 +94,12 @@ func ParseOAuthCallback(input string) (*OAuthCallback, error) {
 			}
 		}
 	}
+	if code == "" && query.Get("userJwt") != "" {
+		code = "trae-enterprise-jwt"
+	}
+	if code == "" && query.Get("data") != "" && query.Get("scope") == "saas" {
+		code = query.Get("data")
+	}
 	state := strings.TrimSpace(query.Get("state"))
 	if state == "" {
 		state = strings.TrimSpace(firstNonEmpty(query.Get("loginTraceID"), query.Get("login_trace_id")))

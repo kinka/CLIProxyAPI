@@ -141,6 +141,7 @@ func (h *Handler) completeTraeOAuth(
 	}()
 
 	var code string
+	var rawCallback string
 	deadline := time.Now().Add(5 * time.Minute)
 
 	for {
@@ -165,40 +166,55 @@ func (h *Handler) completeTraeOAuth(
 					return
 				}
 				code = payload["code"]
+				rawCallback = payload["raw_callback"]
 				break
 			}
 		}
 		time.Sleep(500 * time.Millisecond)
 	}
 
-	if strings.TrimSpace(code) == "" {
-		SetOAuthSessionError(state, "No authorization code received")
-		return
+	var tokenStorage *trae.TraeTokenStorage
+	if rawCallback != "" || strings.Contains(code, "userJwt") {
+		candidate := rawCallback
+		if candidate == "" {
+			candidate = code
+		}
+		if entStorage, errEnt := trae.ParseEnterpriseCallback(candidate, machineID, deviceID); errEnt == nil && entStorage != nil {
+			tokenStorage = entStorage
+		}
 	}
 
-	httpClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second})
+	if tokenStorage == nil {
+		if strings.TrimSpace(code) == "" || code == "trae-enterprise-jwt" {
+			SetOAuthSessionError(state, "No authorization code or credentials received")
+			return
+		}
 
-	ideVersion := "3.3.67"
-	if strings.EqualFold(edition, "sg") {
-		ideVersion = "3.5.51"
-	}
+		httpClient := util.SetProxy(&h.cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second})
 
-	tokenStorage, errExchange := trae.ExchangeTokenByAuthCode(
-		ctx,
-		httpClient,
-		apiHost,
-		code,
-		codeVerifier,
-		pemPubKey,
-		machineID,
-		deviceID,
-		ideVersion,
-		edition,
-	)
-	if errExchange != nil {
-		log.Errorf("Trae token exchange failed: %v", errExchange)
-		SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
-		return
+		ideVersion := "3.3.67"
+		if strings.EqualFold(edition, "sg") {
+			ideVersion = "3.5.51"
+		}
+
+		var errExchange error
+		tokenStorage, errExchange = trae.ExchangeTokenByAuthCode(
+			ctx,
+			httpClient,
+			apiHost,
+			code,
+			codeVerifier,
+			pemPubKey,
+			machineID,
+			deviceID,
+			ideVersion,
+			edition,
+		)
+		if errExchange != nil {
+			log.Errorf("Trae token exchange failed: %v", errExchange)
+			SetOAuthSessionError(state, oauthSessionErrorWithCause("Failed to exchange authorization code for tokens", errExchange))
+			return
+		}
 	}
 
 	if errGuard := guardOAuthSessionPendingForSave(state, "trae"); errGuard != nil {
@@ -212,6 +228,11 @@ func (h *Handler) completeTraeOAuth(
 
 	fileName := fmt.Sprintf("trae-%s-%d.json", strings.ToLower(editionLabel), time.Now().UnixMilli())
 	label := fmt.Sprintf("Trae %s (%s)", editionLabel, tokenStorage.UserID)
+	if tokenStorage.Account != nil {
+		if tName, ok := tokenStorage.Account["tenant_name"].(string); ok && tName != "" {
+			label = fmt.Sprintf("Trae %s (%s - %s)", editionLabel, tokenStorage.UserID, tName)
+		}
+	}
 	if tokenStorage.UserID == "" {
 		label = fmt.Sprintf("Trae %s User", editionLabel)
 	}

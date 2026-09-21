@@ -222,6 +222,12 @@ func (s *Server) setupRoutes() {
 				}
 			}
 		}
+		if code == "" && c.Query("userJwt") != "" {
+			code = "trae-enterprise-jwt"
+		}
+		if code == "" && c.Query("data") != "" && c.Query("scope") == "saas" {
+			code = c.Query("data")
+		}
 		state := strings.TrimSpace(firstNonEmpty(c.Query("state"), c.Query("loginTraceID"), c.Query("login_trace_id")))
 		errStr := strings.TrimSpace(firstNonEmpty(c.Query("error"), c.Query("error_msg"), c.Query("error_description")))
 		if state == "" {
@@ -232,7 +238,7 @@ func (s *Server) setupRoutes() {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "code or error is required"})
 			return
 		}
-		if _, errWrite := managementHandlers.WriteOAuthCallbackFileForPendingSession(s.cfg.AuthDir, "trae", state, code, errStr); errWrite != nil {
+		if _, errWrite := managementHandlers.WriteOAuthCallbackFileWithRawForPendingSession(s.cfg.AuthDir, "trae", state, code, errStr, c.Request.URL.String()); errWrite != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "invalid or expired OAuth callback"})
 			return
 		}

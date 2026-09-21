@@ -126,6 +126,11 @@ func WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, err
 	return internalmanagement.WriteOAuthCallbackFileForPendingSession(authDir, provider, state, code, errorMessage)
 }
 
+// WriteOAuthCallbackFileWithRawForPendingSession writes an OAuth callback payload with raw callback string for a pending session.
+func WriteOAuthCallbackFileWithRawForPendingSession(authDir, provider, state, code, errorMessage, rawCallback string) (string, error) {
+	return internalmanagement.WriteOAuthCallbackFileWithRawForPendingSession(authDir, provider, state, code, errorMessage, rawCallback)
+}
+
 // PopulateAuthContext copies auth metadata from a Gin context into a request context.
 func PopulateAuthContext(ctx context.Context, c *gin.Context) context.Context {
 	return internalmanagement.PopulateAuthContext(ctx, c)

@@ -52,8 +52,9 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 	state := strings.TrimSpace(req.State)
 	code := strings.TrimSpace(req.Code)
 	errMsg := strings.TrimSpace(req.Error)
+	rawRedirect := strings.TrimSpace(req.RedirectURL)
 
-	if rawRedirect := strings.TrimSpace(req.RedirectURL); rawRedirect != "" {
+	if rawRedirect != "" {
 		u, errParse := url.Parse(rawRedirect)
 		if errParse != nil {
 			c.JSON(http.StatusBadRequest, gin.H{"status": "error", "error": "invalid redirect_url"})
@@ -80,6 +81,12 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 					code = infoStr
 				}
 			}
+		}
+		if code == "" && q.Get("userJwt") != "" {
+			code = "trae-enterprise-jwt"
+		}
+		if code == "" && q.Get("data") != "" && q.Get("scope") == "saas" {
+			code = q.Get("data")
 		}
 		if errMsg == "" {
 			errMsg = strings.TrimSpace(firstNonEmpty(q.Get("error"), q.Get("error_msg"), q.Get("error_description")))
@@ -132,7 +139,7 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 		return
 	}
 
-	if _, errWrite := WriteOAuthCallbackFileForPendingSession(h.cfg.AuthDir, canonicalProvider, state, code, errMsg); errWrite != nil {
+	if _, errWrite := WriteOAuthCallbackFileWithRawForPendingSession(h.cfg.AuthDir, canonicalProvider, state, code, errMsg, rawRedirect); errWrite != nil {
 		if errors.Is(errWrite, errOAuthSessionNotPending) {
 			_, status, okSession := GetOAuthSession(state)
 			if okSession && status != "" {

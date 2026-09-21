@@ -224,9 +224,10 @@ waitForCallback:
 				continue
 			}
 			result = &traeauth.TraeOAuthResult{
-				Code:  parsed.Code,
-				State: parsed.State,
-				Error: parsed.Error,
+				Code:   parsed.Code,
+				State:  parsed.State,
+				Error:  parsed.Error,
+				RawURL: input,
 			}
 			break waitForCallback
 		case errManual := <-manualInputErrCh:
@@ -242,29 +243,43 @@ waitForCallback:
 		return nil, fmt.Errorf("trae state mismatch: expected %s, got %s", state, result.State)
 	}
 
-	fmt.Println("Trae authorization code received; exchanging for tokens...")
-
-	httpClient := util.SetProxy(&cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second})
-
-	ideVersion := "3.3.67"
-	if strings.EqualFold(edition, "sg") {
-		ideVersion = "3.5.51"
+	var tokenStorage *traeauth.TraeTokenStorage
+	if result.RawURL != "" || strings.Contains(result.Code, "userJwt") {
+		candidate := result.RawURL
+		if candidate == "" {
+			candidate = result.Code
+		}
+		if entStorage, errEnt := traeauth.ParseEnterpriseCallback(candidate, machineID, deviceID); errEnt == nil && entStorage != nil {
+			tokenStorage = entStorage
+		}
 	}
 
-	tokenStorage, err := traeauth.ExchangeTokenByAuthCode(
-		ctx,
-		httpClient,
-		apiHost,
-		result.Code,
-		pkceCodes.CodeVerifier,
-		pemPubKey,
-		machineID,
-		deviceID,
-		ideVersion,
-		edition,
-	)
-	if err != nil {
-		return nil, fmt.Errorf("trae token exchange failed: %w", err)
+	if tokenStorage == nil {
+		fmt.Println("Trae authorization code received; exchanging for tokens...")
+
+		httpClient := util.SetProxy(&cfg.SDKConfig, &http.Client{Timeout: 30 * time.Second})
+
+		ideVersion := "3.3.67"
+		if strings.EqualFold(edition, "sg") {
+			ideVersion = "3.5.51"
+		}
+
+		var errExchange error
+		tokenStorage, errExchange = traeauth.ExchangeTokenByAuthCode(
+			ctx,
+			httpClient,
+			apiHost,
+			result.Code,
+			pkceCodes.CodeVerifier,
+			pemPubKey,
+			machineID,
+			deviceID,
+			ideVersion,
+			edition,
+		)
+		if errExchange != nil {
+			return nil, fmt.Errorf("trae token exchange failed: %w", errExchange)
+		}
 	}
 
 	return a.buildAuthRecord(tokenStorage)

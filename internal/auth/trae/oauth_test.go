@@ -193,3 +193,31 @@ func TestTraeOAuthServer(t *testing.T) {
 		t.Errorf("expected state 'my-state', got %q", res.State)
 	}
 }
+
+func TestParseEnterpriseCallback(t *testing.T) {
+	rawURL := `http://127.0.0.1:8317/authorize?scope=saas&host=https%3A%2F%2Fconsole.enterprise.trae.cn&consoleHost=https%3A%2F%2Fconsole.enterprise.trae.cn&coreHost=https%3A%2F%2Fconsole.enterprise.trae.cn&isRedirect=true&loginTraceID=9dfb3b839f9ede128fa77bafe0d6b711&userJwt=%7B%22RefreshToken%22%3A%22DJvJ5SoUVByYeBKOoUFHvyQo4Lw17I8WoSy0VBdrYhw%3D.18d73bba2293d0c4%22%2C%22RefreshExpireAt%22%3A1797741047530%2C%22Token%22%3A%22mock-jwt-token%22%2C%22TokenExpireAt%22%3A1791174647537%2C%22TokenExpireDuration%22%3A1209600000%7D&userInfo=%7B%22UserInfo%22%3A%7B%22UserID%22%3A%22419608832%22%2C%22Name%22%3A%22%E9%BB%84%E9%92%A6%E4%BD%B3%22%2C%22Avatar%22%3A%22%22%2C%22Account%22%3A%22kinkabrain%40gmail.com%22%2C%22Password%22%3A%22%22%2C%22Email%22%3A%22kinkabrain%40gmail.com%22%2C%22UserStatus%22%3A1%2C%22RoleID%22%3A3%2C%22TenantID%22%3A%22275232256%22%7D%2C%22TenantInfoBase%22%3A%7B%22TenantID%22%3A275232256%2C%22TenantName%22%3A%22%E5%B9%BF%E5%8F%91%E8%AF%81%E5%88%B8%E8%82%A1%E4%BB%BD%E6%9C%89%E9%99%90%E5%85%AC%E5%8F%B8%22%7D%7D`
+
+	storage, err := ParseEnterpriseCallback(rawURL, "m-id-1", "d-id-1")
+	if err != nil {
+		t.Fatalf("ParseEnterpriseCallback failed: %v", err)
+	}
+	if storage == nil {
+		t.Fatalf("expected storage not nil")
+	}
+	if storage.AccessToken != "mock-jwt-token" {
+		t.Errorf("expected access token 'mock-jwt-token', got %q", storage.AccessToken)
+	}
+	if storage.UserID != "419608832" {
+		t.Errorf("expected user id '419608832', got %q", storage.UserID)
+	}
+	if storage.Edition != "enterprise" {
+		t.Errorf("expected edition 'enterprise', got %q", storage.Edition)
+	}
+	if storage.Host != "https://console.enterprise.trae.cn" {
+		t.Errorf("expected host https://console.enterprise.trae.cn, got %q", storage.Host)
+	}
+	if storage.Account["tenant_name"] != "广发证券股份有限公司" {
+		t.Errorf("expected tenant name '广发证券股份有限公司', got %v", storage.Account["tenant_name"])
+	}
+}
+
