@@ -342,14 +342,19 @@ func TestIsTransitionalDeferralText(t *testing.T) {
 	}{
 		{"我找到了问题所在。让我进一步确认：", true},
 		{"让我检查一下 gemini/antigravity 的实际采集逻辑，看看为什么额度一直没更新：", true},
+		{"我来同时查看 git commit 信息和该文件内容。", true},
 		{"我来查看一下当前目录下的文件：", true},
 		{"我先检查一下配额配置：", true},
+		{"好的，我来检查一下。", true},
+		{"好的，马上排查。", true},
 		{"Let me check the status:", true},
 		{"Let me examine the logs:", true},
 		{"I will check the configuration:", true},
+		{"I will examine the git commit and the file.", true},
 		{"排查完成。问题原因是由于 token 已经过期，重新刷新后即可正常使用。", false},
 		{"Here is the final summary of the issue.", false},
 		{"让我检查一下代码。这里发现了一个语法错误：在第 45 行缺少分号。修复方法如下：", false},
+		{"```go\nfunc main() {}\n```", false},
 	}
 
 	for _, c := range cases {

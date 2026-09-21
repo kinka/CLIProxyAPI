@@ -850,11 +850,26 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 										currentPayload = newPayload
 										currentEvent = ""
 										fullAssistantContent.Reset()
+										toolFilter = helps.NewToolCallStreamFilter(toolMap)
 										continue
+									} else {
+										log.Warnf("trae executor stream: auto-drive peek error: peekErr=%v, errPeek=%v", peekErr, errPeek)
+									}
+								} else {
+									if errNewDo != nil {
+										log.Warnf("trae executor stream: auto-drive request failed: %v", errNewDo)
+									} else {
+										log.Warnf("trae executor stream: auto-drive HTTP status: %d", newResp.StatusCode)
 									}
 								}
+							} else {
+								log.Warnf("trae executor stream: auto-drive create request error: %v", errNewReq)
 							}
+						} else {
+							log.Warnf("trae executor stream: auto-drive buildBody error: %v", errNewBuild)
 						}
+					} else {
+						log.Warnf("trae executor stream: auto-drive appendMessages error: %v", errAppend)
 					}
 				}
 

@@ -554,7 +554,7 @@ func FormatTraeMessagesWithTools(root gjson.Result) ([]map[string]any, map[strin
 		sb.WriteString("<toolcall>{\"name\": \"ToolName\", \"params\": {\"param1\": \"value1\"}}</toolcall>\n\n")
 		sb.WriteString("CRITICAL AGENT RULES:\n")
 		sb.WriteString("- When you need to inspect files, execute commands, or gather workspace information, you MUST call the appropriate tool immediately in your response.\n")
-		sb.WriteString("- DO NOT merely state what you will do (e.g. avoid saying 'I will check...', 'Let me run...', '我来查看' without calling the tool). You MUST emit the <toolcall> block directly.\n")
+		sb.WriteString("- DO NOT merely state what you will do (e.g. avoid saying 'I will check...', 'Let me run...', '我来查看...', '我来同时查看...', '让我检查...' without calling the tool). You MUST emit the <toolcall> block directly in the same turn.\n")
 		sb.WriteString("- The <toolcall> block MUST contain valid JSON with \"name\" and \"params\" keys\n")
 		sb.WriteString("- Do NOT use XML attributes like: ToolName param=\"value\"\n")
 		sb.WriteString("- Do NOT use <arg_key>/<arg_value> tags\n")
@@ -625,7 +625,7 @@ func FormatTraeMessagesWithTools(root gjson.Result) ([]map[string]any, map[strin
 				} else {
 					reminder = "\n\n[Agent Action Rule / 行动硬约束:\n" +
 						"1. 你有权调用工具。如果需要查看文件、执行命令或排查代码，必须在当前回复中立即输出 <toolcall> 工具调用；\n" +
-						"2. 【严禁只说不做】：严禁仅输出“好的我来排查”、“让我看一下”、“稍等”等说明性文字后停下等待，必须直接输出 <toolcall>！]"
+						"2. 【严禁空头表态与只说不做】：严禁仅输出“我来查看...”、“我来同时查看...”、“好的我来排查”、“让我看一下”、“稍等”等说明性文字后停下等待！必须在当前回复中直接输出 <toolcall> 工具调用代码块！]"
 				}
 				uBlocks[len(uBlocks)-1]["text"] = lastBlockText + reminder
 				msgs[lastIdx]["content"] = uBlocks
@@ -1470,9 +1470,15 @@ func (f *ToolCallStreamFilter) HasEmittedCalls() bool {
 	return len(f.emittedCalls) > 0
 }
 
+var (
+	chineseIntentRegexp      = regexp.MustCompile(`(?i)(我来|让我|我先|我这就|我马上|我将|我会|接下来|下面|稍等|我先去|我去|现在).*(查看|检查|排查|确认|看一下|看下|分析|运行|执行|搜索|查找|读取|获取|调取|统计|定位|核实|核对|看看|比对)`)
+	englishIntentRegexp      = regexp.MustCompile(`(?i)\b(let me|i will|i'll|i am going to|i'm going to|i shall)\b.*?\b(check|inspect|verify|examine|see|look|run|execute|search|find|read|get|investigate|analyze|view)\b`)
+	chineseShortAffirmRegexp = regexp.MustCompile(`^(好的|没问题|稍等|了解|收到)[，,、 ]*(我来|让我|马上|立即|先).*`)
+)
+
 // IsTransitionalDeferralText checks whether a text response from the model is merely an
 // introductory conversational promise or deferral (e.g. "我找到了问题所在。让我进一步确认：",
-// "让我检查一下...", "Let me check...") without emitting any tool call or final answer.
+// "我来同时查看 git commit 信息和该文件内容。", "让我检查一下...", "Let me check...") without emitting any tool call or final answer.
 func IsTransitionalDeferralText(text string) bool {
 	trimmed := strings.TrimSpace(text)
 	if trimmed == "" {
@@ -1483,10 +1489,16 @@ func IsTransitionalDeferralText(text string) bool {
 		return false
 	}
 
+	// Code blocks indicate substantive content, not pure deferrals.
+	if strings.Contains(trimmed, "```") {
+		return false
+	}
+
 	// If the text contains substantive solution or conclusion keywords, it is not a deferral.
 	substantiveKeywords := []string{
 		"修复方法", "解决方案", "修改建议", "解决方法", "修复如下",
 		"总结如下", "排查结论", "最终结论", "参考代码", "代码如下",
+		"修改如下", "分析结果如下", "排查结果如下", "问题原因如下",
 	}
 	for _, kw := range substantiveKeywords {
 		if strings.Contains(trimmed, kw) {
@@ -1494,65 +1506,22 @@ func IsTransitionalDeferralText(text string) bool {
 		}
 	}
 
-	lower := strings.ToLower(trimmed)
-
-	// Check for ending colon (standard introductory indicator in Chinese/English)
+	// Check colon or ellipsis suffix with short text (standard introductory indicator)
 	hasColonSuffix := strings.HasSuffix(trimmed, "：") || strings.HasSuffix(trimmed, ":")
-
-	transitionalPhrases := []string{
-		"让我进一步", "让我检查", "让我查看", "让我排查", "让我确认",
-		"让我看一下", "让我看下", "让我分析", "让我运行", "让我执行",
-		"我来进一步", "我来检查", "我来查看", "我来排查", "我来确认",
-		"我来看一下", "我来看下", "我来分析", "我来运行", "我来执行",
-		"接下来我将", "接下来我会", "接下来进行", "下面我将", "下面我会",
-		"稍等，我", "稍等我", "我先检查", "我先查看", "我先确认",
-		"正在排查", "正在检查", "正在查看",
-		"问题所在。让我", "问题所在，让我", "找到原因。让我", "找到原因，让我",
-		"进一步排查", "进一步确认", "进一步检查", "进一步查看",
-		"let me check", "let me inspect", "let me verify", "let me examine",
-		"let me see", "let me look", "i will check", "i will inspect",
-		"i will verify", "i will examine", "i will look",
+	hasEllipsisSuffix := strings.HasSuffix(trimmed, "...") || strings.HasSuffix(trimmed, "。。。")
+	if (hasColonSuffix || hasEllipsisSuffix) && len(runes) < 100 {
+		return true
 	}
 
-	// Extract the last clause
-	parts := strings.FieldsFunc(trimmed, func(r rune) bool {
-		return r == '。' || r == '！' || r == '!' || r == '？' || r == '?' || r == '\n'
-	})
-	lastClause := trimmed
-	if len(parts) > 0 {
-		lastClause = strings.TrimSpace(parts[len(parts)-1])
+	// Match Chinese or English intent statements (e.g. "我来同时查看...", "让我进一步确认", "Let me check...")
+	if chineseIntentRegexp.MatchString(trimmed) {
+		return true
 	}
-	lowerLast := strings.ToLower(lastClause)
-
-	hasTransitionalInLastClause := false
-	for _, p := range transitionalPhrases {
-		if strings.Contains(lowerLast, strings.ToLower(p)) {
-			hasTransitionalInLastClause = true
-			break
-		}
+	if englishIntentRegexp.MatchString(trimmed) {
+		return true
 	}
-
-	hasTransitionalOverall := false
-	for _, p := range transitionalPhrases {
-		if strings.Contains(lower, strings.ToLower(p)) {
-			hasTransitionalOverall = true
-			break
-		}
-	}
-
-	if hasColonSuffix {
-		// If ending with a colon, the final clause must be transitional
-		return hasTransitionalInLastClause
-	}
-
-	if hasTransitionalOverall {
-		if len(runes) < 60 {
-			return true
-		}
-		if strings.HasSuffix(trimmed, "...") || strings.HasSuffix(trimmed, "。。。") ||
-			strings.HasSuffix(trimmed, "一下") || strings.HasSuffix(trimmed, "看看") {
-			return true
-		}
+	if chineseShortAffirmRegexp.MatchString(trimmed) {
+		return true
 	}
 
 	return false
