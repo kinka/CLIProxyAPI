@@ -342,6 +342,8 @@ func TestIsTransitionalDeferralText(t *testing.T) {
 	}{
 		{"我找到了问题所在。让我进一步确认：", true},
 		{"让我检查一下 gemini/antigravity 的实际采集逻辑，看看为什么额度一直没更新：", true},
+		{"`project_id` 都存在。那问题就在 API 调用或解析响应上了。让我手动调用一下看看真实的响应：", true},
+		{"我找到问题了！\n\n看 `cliproxy-quota.json` 缓存文件，`antigravity`（gemini）的数据确实**有更新**，但**所有账户的额度都显示 0% used**，这不太正常。\n\n让我直接检查一下 gemini 的实际 API 调用逻辑：", true},
 		{"我来同时查看 git commit 信息和该文件内容。", true},
 		{"我来查看一下当前目录下的文件：", true},
 		{"我先检查一下配额配置：", true},

@@ -1471,7 +1471,7 @@ func (f *ToolCallStreamFilter) HasEmittedCalls() bool {
 }
 
 var (
-	chineseIntentRegexp      = regexp.MustCompile(`(?i)(我来|让我|我先|我这就|我马上|我将|我会|接下来|下面|稍等|我先去|我去|现在).*(查看|检查|排查|确认|看一下|看下|分析|运行|执行|搜索|查找|读取|获取|调取|统计|定位|核实|核对|看看|比对)`)
+	chineseIntentRegexp      = regexp.MustCompile(`(?i)(我来|让我|我先|我这就|我马上|我将|我会|接下来|下面|稍等|我先去|我去|现在|那我|继续|开始).*(查看|检查|排查|确认|看一下|看下|分析|运行|执行|搜索|查找|读取|获取|调取|调用|测试|验证|查一下|探查|统计|定位|核实|核对|看看|比对)`)
 	englishIntentRegexp      = regexp.MustCompile(`(?i)\b(let me|i will|i'll|i am going to|i'm going to|i shall)\b.*?\b(check|inspect|verify|examine|see|look|run|execute|search|find|read|get|investigate|analyze|view)\b`)
 	chineseShortAffirmRegexp = regexp.MustCompile(`^(好的|没问题|稍等|了解|收到)[，,、 ]*(我来|让我|马上|立即|先).*`)
 )
@@ -1485,7 +1485,7 @@ func IsTransitionalDeferralText(text string) bool {
 		return false
 	}
 	runes := []rune(trimmed)
-	if len(runes) > 150 {
+	if len(runes) > 500 {
 		return false
 	}
 
@@ -1506,18 +1506,37 @@ func IsTransitionalDeferralText(text string) bool {
 		}
 	}
 
-	// Check colon or ellipsis suffix with short text (standard introductory indicator)
-	hasColonSuffix := strings.HasSuffix(trimmed, "：") || strings.HasSuffix(trimmed, ":")
-	hasEllipsisSuffix := strings.HasSuffix(trimmed, "...") || strings.HasSuffix(trimmed, "。。。")
-	if (hasColonSuffix || hasEllipsisSuffix) && len(runes) < 100 {
+	// Extract the last non-empty line or clause
+	lines := strings.Split(trimmed, "\n")
+	var lastLine string
+	for i := len(lines) - 1; i >= 0; i-- {
+		l := strings.TrimSpace(lines[i])
+		if l != "" {
+			lastLine = l
+			break
+		}
+	}
+
+	// Check colon suffix (standard introductory indicator in Chinese/English)
+	hasColonSuffix := strings.HasSuffix(trimmed, "：") || strings.HasSuffix(trimmed, ":") ||
+		strings.HasSuffix(lastLine, "：") || strings.HasSuffix(lastLine, ":")
+
+	hasEllipsisSuffix := strings.HasSuffix(trimmed, "...") || strings.HasSuffix(trimmed, "。。。") ||
+		strings.HasSuffix(lastLine, "...") || strings.HasSuffix(lastLine, "。。。")
+
+	if hasColonSuffix && (len(runes) < 250 || chineseIntentRegexp.MatchString(lastLine) || englishIntentRegexp.MatchString(lastLine)) {
+		return true
+	}
+
+	if hasEllipsisSuffix && (len(runes) < 150 || chineseIntentRegexp.MatchString(lastLine) || englishIntentRegexp.MatchString(lastLine)) {
 		return true
 	}
 
 	// Match Chinese or English intent statements (e.g. "我来同时查看...", "让我进一步确认", "Let me check...")
-	if chineseIntentRegexp.MatchString(trimmed) {
+	if chineseIntentRegexp.MatchString(lastLine) || (len(runes) < 120 && chineseIntentRegexp.MatchString(trimmed)) {
 		return true
 	}
-	if englishIntentRegexp.MatchString(trimmed) {
+	if englishIntentRegexp.MatchString(lastLine) || (len(runes) < 120 && englishIntentRegexp.MatchString(trimmed)) {
 		return true
 	}
 	if chineseShortAffirmRegexp.MatchString(trimmed) {
