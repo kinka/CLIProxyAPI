@@ -147,6 +147,16 @@ func TestParseToolcallContent(t *testing.T) {
 	if !strings.Contains(call3.Args, "whoami") {
 		t.Fatalf("expected args to contain whoami, got %s", call3.Args)
 	}
+
+	// Test 4: DSML format (DeepSeek)
+	dsml1 := `<｜DSML｜ invoke name="Bash"><｜DSML｜ parameter name="command" string="true">git status</｜DSML｜ parameter></｜DSML｜ invoke>`
+	call4, ok := helps.ParseToolcallContent(dsml1, toolMap)
+	if !ok || call4.Name != "Bash" {
+		t.Fatalf("failed to parse DSML style, got %+v", call4)
+	}
+	if !strings.Contains(call4.Args, "git status") {
+		t.Fatalf("expected args to contain git status, got %s", call4.Args)
+	}
 }
 
 func TestExtractAndStripToolCalls(t *testing.T) {
@@ -275,5 +285,52 @@ func TestFormatOpenAINonStreamResponseWithTools(t *testing.T) {
 	var m map[string]any
 	if err := json.Unmarshal(respJSON, &m); err != nil {
 		t.Fatalf("invalid json: %v", err)
+	}
+}
+
+func TestToolCallStreamFilterDSML(t *testing.T) {
+	toolMap := map[string]string{
+		"bash": "Bash",
+	}
+	filter := helps.NewToolCallStreamFilter(toolMap)
+
+	chunks := []string{
+		"Checking branch.\n",
+		"<｜DSML｜ calls>\n",
+		"<｜DSML｜ invoke name=\"Bash\">\n",
+		"<｜DSML｜ parameter name=\"command\" string=\"true\">git branch --show-current</｜DSML｜ parameter>\n",
+		"</｜DSML｜ invoke>\n",
+		"</｜DSML｜ calls>\n",
+		"All done.",
+	}
+
+	var visibleText strings.Builder
+	var allCalls []helps.TraeToolCall
+
+	for _, c := range chunks {
+		txt, calls := filter.Feed(c)
+		visibleText.WriteString(txt)
+		allCalls = append(allCalls, calls...)
+	}
+	flushTxt, finalCalls := filter.Flush()
+	visibleText.WriteString(flushTxt)
+	allCalls = append(allCalls, finalCalls...)
+
+	if len(allCalls) != 1 {
+		t.Fatalf("expected 1 call extracted from DSML stream, got %d", len(allCalls))
+	}
+	if allCalls[0].Name != "Bash" {
+		t.Fatalf("expected tool call name Bash, got %s", allCalls[0].Name)
+	}
+	if !strings.Contains(allCalls[0].Args, "git branch --show-current") {
+		t.Fatalf("expected args to contain git branch, got %s", allCalls[0].Args)
+	}
+
+	outText := visibleText.String()
+	if strings.Contains(outText, "DSML") || strings.Contains(outText, "invoke") {
+		t.Fatalf("visible text leaked DSML tag: %s", outText)
+	}
+	if !strings.Contains(outText, "Checking branch.") || !strings.Contains(outText, "All done.") {
+		t.Fatalf("missing normal text in output: %s", outText)
 	}
 }

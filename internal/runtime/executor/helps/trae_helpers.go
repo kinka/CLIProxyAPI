@@ -27,7 +27,7 @@ const (
 func ModelPrefersRawChat(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	switch m {
-	case "kimi-k3", "kimi-k2.8-preview", "kimi-k2.8", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "deepseek-v4-flash-official", "qwen3.8-max", "qwen-3.8-max":
+	case "kimi-k3", "k3", "kimi-k2.8-preview", "kimi-k2.8", "k2.8", "deepseek-v4.1-flash", "dsf", "glm-5.3", "glm-5.3-flash", "gf", "deepseek-v4-flash-official", "qwen3.8-max", "qwen-3.8-max":
 		return true
 	}
 	return false
@@ -42,15 +42,15 @@ func ResolveTraeModel(model string) (functionName string, configName string) {
 
 	// Exact matches / direct configs
 	switch m {
-	case "kimi-k3":
+	case "kimi-k3", "k3":
 		return "solo_agent", "kimi-k3"
-	case "kimi-k2.8-preview", "kimi-k2.8":
+	case "kimi-k2.8-preview", "kimi-k2.8", "k2.8":
 		return "solo_agent", "kimi-k2.8-preview"
-	case "deepseek-v4.1-flash":
+	case "deepseek-v4.1-flash", "dsf":
 		return "solo_agent", "DeepSeek-V4.1-Flash"
 	case "glm-5.3":
 		return "solo_agent", "glm-5.3"
-	case "glm-5.3-flash":
+	case "glm-5.3-flash", "gf":
 		return "solo_agent", "glm-5.3-flash"
 	case "deepseek-v4-pro-official":
 		return "solo_agent", "DeepSeek-V4-Pro-Official"
@@ -535,7 +535,9 @@ func FormatTraeMessagesWithTools(root gjson.Result) ([]map[string]any, map[strin
 		sb.WriteString("\n\n<available_tools>\n")
 		sb.WriteString("You have access to the following tools. To call a tool, output a toolcall block in JSON format:\n")
 		sb.WriteString("<toolcall>{\"name\": \"ToolName\", \"params\": {\"param1\": \"value1\"}}</toolcall>\n\n")
-		sb.WriteString("CRITICAL RULES:\n")
+		sb.WriteString("CRITICAL AGENT RULES:\n")
+		sb.WriteString("- When you need to inspect files, execute commands, or gather workspace information, you MUST call the appropriate tool immediately in your response.\n")
+		sb.WriteString("- DO NOT merely state what you will do (e.g. avoid saying 'I will check...', 'Let me run...', '我来查看' without calling the tool). You MUST emit the <toolcall> block directly.\n")
 		sb.WriteString("- The <toolcall> block MUST contain valid JSON with \"name\" and \"params\" keys\n")
 		sb.WriteString("- Do NOT use XML attributes like: ToolName param=\"value\"\n")
 		sb.WriteString("- Do NOT use <arg_key>/<arg_value> tags\n")
@@ -1091,7 +1093,26 @@ func ParseToolcallContent(inner string, toolMap map[string]string) (TraeToolCall
 		}
 	}
 
-	// 5. XML attribute style: ToolName key="value"
+	// 5. DSML format: <[｜|]DSML[｜|] invoke name="Name">...<[｜|]DSML[｜|] parameter name="param">value</[｜|]DSML[｜|] parameter>
+	if strings.Contains(trimmed, "DSML") || strings.Contains(trimmed, "dsml") {
+		name := ""
+		reName := regexp.MustCompile(`(?i)<[｜|]dsml[｜|]\s+invoke\s+name=["']([^"']+)["']`)
+		if m := reName.FindStringSubmatch(trimmed); len(m) > 1 {
+			name = m[1]
+		}
+		paramMatches := regexp.MustCompile(`(?is)<[｜|]dsml[｜|]\s+parameter\s+name=["']([^"']+)["'][^>]*>(.*?)</[｜|]dsml[｜|]\s+parameter>`).FindAllStringSubmatch(trimmed, -1)
+		if len(paramMatches) > 0 || name != "" {
+			params := make(map[string]any)
+			for _, pm := range paramMatches {
+				pName := pm[1]
+				pVal := strings.TrimSpace(pm[2])
+				params[pName] = pVal
+			}
+			return buildToolCall(name, params, toolMap), true
+		}
+	}
+
+	// 6. XML attribute style: ToolName key="value"
 	fields := strings.Fields(trimmed)
 	if len(fields) > 0 && !strings.HasPrefix(fields[0], "<") {
 		name := fields[0]
@@ -1108,7 +1129,7 @@ func ParseToolcallContent(inner string, toolMap map[string]string) (TraeToolCall
 	return TraeToolCall{}, false
 }
 
-// ExtractToolCallsFromText extracts all <toolcall> tags from full text.
+// ExtractToolCallsFromText extracts all <toolcall> and DSML tags from full text.
 func ExtractToolCallsFromText(text string, toolMap map[string]string) []TraeToolCall {
 	var calls []TraeToolCall
 	matches := reToolCall.FindAllStringSubmatch(text, -1)
@@ -1116,6 +1137,16 @@ func ExtractToolCallsFromText(text string, toolMap map[string]string) []TraeTool
 	for _, m := range matches {
 		rawInner := m[2]
 		if tc, ok := ParseToolcallContent(rawInner, toolMap); ok {
+			tc.Index = idx
+			idx++
+			calls = append(calls, tc)
+		}
+	}
+	// Check DSML invokes
+	reDsml := regexp.MustCompile(`(?is)<[｜|]dsml[｜|]\s+invoke\s+name=["']([^"']+)["'][^>]*>(.*?)(?:</[｜|]dsml[｜|]\s+invoke>|$)`)
+	dsmlMatches := reDsml.FindAllStringSubmatch(text, -1)
+	for _, m := range dsmlMatches {
+		if tc, ok := ParseToolcallContent(m[0], toolMap); ok {
 			tc.Index = idx
 			idx++
 			calls = append(calls, tc)
@@ -1139,10 +1170,15 @@ func ExtractToolCallsFromText(text string, toolMap map[string]string) []TraeTool
 	return calls
 }
 
-// StripToolCallsFromText removes <toolcall>...</toolcall> tags from generated content.
+// StripToolCallsFromText removes <toolcall> and DSML tags from generated content.
 func StripToolCallsFromText(text string) string {
-	re := regexp.MustCompile(`(?s)<(?:tool_call|toolcall)(?:\s[^>]*)?>.*?(</(?:tool_call|toolcall)>|$)`)
-	return strings.TrimSpace(re.ReplaceAllString(text, ""))
+	re := regexp.MustCompile(`(?s)<(?:tool_call|toolcall|function_call|functioncall)(?:\s[^>]*)?>.*?(</(?:tool_call|toolcall|function_call|functioncall)>|$)`)
+	text = re.ReplaceAllString(text, "")
+	reDsml := regexp.MustCompile(`(?is)<[｜|]dsml[｜|]\s+invoke(?:\s[^>]*)?>.*?(</[｜|]dsml[｜|]\s+invoke>|$)`)
+	text = reDsml.ReplaceAllString(text, "")
+	reDsmlOther := regexp.MustCompile(`(?is)</?[｜|]dsml[｜|][^>]*>`)
+	text = reDsmlOther.ReplaceAllString(text, "")
+	return strings.TrimSpace(text)
 }
 
 // FormatOpenAIStreamToolCallChunk constructs an SSE chunk with delta.tool_calls in OpenAI format.
@@ -1184,18 +1220,48 @@ func FormatOpenAIStreamToolCallChunk(id, model string, calls []TraeToolCall) []b
 	return b
 }
 
+func isContainerTag(s string) bool {
+	lower := strings.ToLower(s)
+	return strings.HasPrefix(lower, "<|dsml| calls") ||
+		strings.HasPrefix(lower, "<｜dsml｜ calls") ||
+		strings.HasPrefix(lower, "</|dsml| calls") ||
+		strings.HasPrefix(lower, "</｜dsml｜ calls") ||
+		strings.HasPrefix(lower, "<|tool calls|") ||
+		strings.HasPrefix(lower, "<｜tool calls｜") ||
+		strings.HasPrefix(lower, "</|tool calls|") ||
+		strings.HasPrefix(lower, "</｜tool calls｜")
+}
+
 func isToolCallPrefix(s string) bool {
-	return strings.HasPrefix("<toolcall>", s) ||
-		strings.HasPrefix("<tool_call>", s) ||
-		strings.HasPrefix("<toolcall ", s) ||
-		strings.HasPrefix("<tool_call ", s)
+	lower := strings.ToLower(s)
+	return strings.HasPrefix("<toolcall>", lower) ||
+		strings.HasPrefix("<tool_call>", lower) ||
+		strings.HasPrefix("<toolcall ", lower) ||
+		strings.HasPrefix("<tool_call ", lower) ||
+		strings.HasPrefix("<function_call>", lower) ||
+		strings.HasPrefix("<function_call ", lower) ||
+		strings.HasPrefix("<functioncall>", lower) ||
+		strings.HasPrefix("<functioncall ", lower) ||
+		strings.HasPrefix("<|dsml|", lower) ||
+		strings.HasPrefix("<｜dsml｜", lower) ||
+		strings.HasPrefix("</|dsml|", lower) ||
+		strings.HasPrefix("</｜dsml｜", lower) ||
+		strings.HasPrefix("<|tool", lower) ||
+		strings.HasPrefix("<｜tool", lower)
 }
 
 func isToolCallTag(s string) bool {
-	return strings.HasPrefix(s, "<toolcall>") ||
-		strings.HasPrefix(s, "<tool_call>") ||
-		strings.HasPrefix(s, "<toolcall ") ||
-		strings.HasPrefix(s, "<tool_call ")
+	lower := strings.ToLower(s)
+	return strings.HasPrefix(lower, "<toolcall>") ||
+		strings.HasPrefix(lower, "<tool_call>") ||
+		strings.HasPrefix(lower, "<toolcall ") ||
+		strings.HasPrefix(lower, "<tool_call ") ||
+		strings.HasPrefix(lower, "<function_call>") ||
+		strings.HasPrefix(lower, "<function_call ") ||
+		strings.HasPrefix(lower, "<functioncall>") ||
+		strings.HasPrefix(lower, "<functioncall ") ||
+		strings.HasPrefix(lower, "<|dsml| invoke") ||
+		strings.HasPrefix(lower, "<｜dsml｜ invoke")
 }
 
 // ToolCallStreamFilter buffers streaming chunks, hides <toolcall> tags from text output,
@@ -1234,10 +1300,19 @@ func (f *ToolCallStreamFilter) Feed(chunk string) (string, []TraeToolCall) {
 			bufStr := f.toolCallBuffer.String()
 
 			closingTag := ""
-			if strings.HasSuffix(bufStr, "</toolcall>") {
+			lowerBuf := strings.ToLower(bufStr)
+			if strings.HasSuffix(lowerBuf, "</toolcall>") {
 				closingTag = "</toolcall>"
-			} else if strings.HasSuffix(bufStr, "</tool_call>") {
+			} else if strings.HasSuffix(lowerBuf, "</tool_call>") {
 				closingTag = "</tool_call>"
+			} else if strings.HasSuffix(lowerBuf, "</function_call>") {
+				closingTag = "</function_call>"
+			} else if strings.HasSuffix(lowerBuf, "</functioncall>") {
+				closingTag = "</functioncall>"
+			} else if strings.HasSuffix(lowerBuf, "</|dsml| invoke>") {
+				closingTag = "</|dsml| invoke>"
+			} else if strings.HasSuffix(lowerBuf, "</｜dsml｜ invoke>") {
+				closingTag = "</｜dsml｜ invoke>"
 			}
 
 			if closingTag != "" {
@@ -1257,22 +1332,30 @@ func (f *ToolCallStreamFilter) Feed(chunk string) (string, []TraeToolCall) {
 			bufStr := f.toolCallBuffer.String()
 
 			if ch == '>' {
-				// Check if this formed a <toolcall> or <tool_call> start
+				// Check if this formed a container tag or a tool call start
 				ltIdx := strings.LastIndex(bufStr, "<")
 				if ltIdx >= 0 {
 					tagCandidate := bufStr[ltIdx:]
-					if isToolCallTag(tagCandidate) {
-						f.inToolCall = true
+					if isContainerTag(tagCandidate) {
 						if ltIdx > 0 {
 							textOut.WriteString(bufStr[:ltIdx])
 						}
 						f.toolCallBuffer.Reset()
 						continue
 					}
+					if isToolCallTag(tagCandidate) {
+						f.inToolCall = true
+						if ltIdx > 0 {
+							textOut.WriteString(bufStr[:ltIdx])
+						}
+						f.toolCallBuffer.Reset()
+						f.toolCallBuffer.WriteString(tagCandidate)
+						continue
+					}
 				}
 			}
 
-			// If buffer doesn't look like an in-progress <toolcall tag, flush text
+			// If buffer doesn't look like an in-progress tag, flush text
 			ltIdx := strings.LastIndex(bufStr, "<")
 			if ltIdx == -1 {
 				textOut.WriteString(bufStr)
@@ -1287,7 +1370,7 @@ func (f *ToolCallStreamFilter) Feed(chunk string) (string, []TraeToolCall) {
 					f.toolCallBuffer.Reset()
 					f.toolCallBuffer.WriteString(candidate)
 				}
-			} else if !isToolCallPrefix(bufStr) && f.toolCallBuffer.Len() > 20 {
+			} else if !isToolCallPrefix(bufStr) && f.toolCallBuffer.Len() > 30 {
 				textOut.WriteString(bufStr)
 				f.toolCallBuffer.Reset()
 			}
