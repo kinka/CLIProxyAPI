@@ -691,8 +691,17 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		toolMap := helps.ExtractToolMapFromPayload(currentPayload, originalPayload)
 		toolFilter := helps.NewToolCallStreamFilter(toolMap)
 		var fullAssistantContent strings.Builder
+		// Upstream sometimes answers a continuation with reasoning only and no body text.
+		// That is still real output, so track it separately instead of letting the turn
+		// look empty.
+		var fullAssistantReasoning strings.Builder
 		autoDriveCount := 0
 		const maxAutoDrive = 3
+		// Every auto-drive continuation is rebuilt from the payload as it stood before the
+		// first drive, so repeated attempts never stack drive prompts on top of each other
+		// (which would also put two user messages back to back).
+		driveBasePayload := currentPayload
+		driveAssistantText := ""
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -705,6 +714,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 
 			if parsed.Type == "text" {
 				if parsed.Reasoning != "" {
+					fullAssistantReasoning.WriteString(parsed.Reasoning)
 					chunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, "", parsed.Reasoning, "")
 					lineChunk := append([]byte("data: "), chunkJSON...)
 					lineChunk = append(lineChunk, []byte("\n\n")...)
@@ -817,28 +827,42 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				// prompt the model to call the tool immediately within the same turn.
 				hasEmittedCalls := toolFilter.HasEmittedCalls() || len(finalCalls) > 0
 				accumulatedText := strings.TrimSpace(fullAssistantContent.String())
+				reasoningOnly := accumulatedText == "" && strings.TrimSpace(fullAssistantReasoning.String()) != ""
 				// A turn with no content at all would otherwise fall through to end_turn and
 				// stall the agent loop, so drive it the same way a deferral is driven.
-				emptyTurn := accumulatedText == ""
+				emptyTurn := accumulatedText == "" && !reasoningOnly
+				// Once a drive is under way the turn is already known to be stalled, so keep
+				// driving until the budget runs out instead of demanding that each follow-up
+				// also look like a deferral.
 				needsAutoDrive := !hasEmittedCalls && autoDriveCount < maxAutoDrive &&
-					(emptyTurn || helps.IsTransitionalDeferralText(accumulatedText))
+					(autoDriveCount > 0 || emptyTurn || helps.IsTransitionalDeferralText(accumulatedText))
 				if needsAutoDrive {
 					autoDriveCount++
 					var prompt string
-					if emptyTurn {
-						log.Infof("trae executor stream: turn produced no content and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
-						prompt = "【Agent Action Rule: Your previous reply was empty. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】"
-					} else {
+					switch {
+					case accumulatedText != "":
 						log.Infof("trae executor stream: detected transitional deferral %q with no tool call, auto-driving (attempt %d/%d)", accumulatedText, autoDriveCount, maxAutoDrive)
 						prompt = fmt.Sprintf("【Agent Action Rule: You stated: %q. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】", accumulatedText)
+					case reasoningOnly:
+						log.Infof("trae executor stream: turn produced reasoning but no reply and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
+						prompt = "【Agent Action Rule: Your previous turn produced internal reasoning but no reply and no action. Stop deliberating. Call the next tool immediately using <toolcall> to execute your action now.】"
+					default:
+						log.Infof("trae executor stream: turn produced no content and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
+						prompt = "【Agent Action Rule: Your previous reply was empty. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】"
 					}
 
-					extraMsgs := make([]map[string]any, 0, 2)
+					// Remember the last real assistant text so later attempts keep the
+					// assistant/user alternation intact even when a continuation comes back
+					// without any body text.
 					if accumulatedText != "" {
-						extraMsgs = append(extraMsgs, map[string]any{"role": "assistant", "content": accumulatedText})
+						driveAssistantText = accumulatedText
+					}
+					extraMsgs := make([]map[string]any, 0, 2)
+					if driveAssistantText != "" {
+						extraMsgs = append(extraMsgs, map[string]any{"role": "assistant", "content": driveAssistantText})
 					}
 					extraMsgs = append(extraMsgs, map[string]any{"role": "user", "content": prompt})
-					newPayload, errAppend := helps.AppendMessagesToPayload(currentPayload, extraMsgs...)
+					newPayload, errAppend := helps.AppendMessagesToPayload(driveBasePayload, extraMsgs...)
 					if errAppend == nil {
 						// Back-to-back requests on the same conversation can come back empty,
 						// so space the continuation out slightly before retrying.
@@ -870,6 +894,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 										currentPayload = newPayload
 										currentEvent = ""
 										fullAssistantContent.Reset()
+										fullAssistantReasoning.Reset()
 										toolFilter = helps.NewToolCallStreamFilter(toolMap)
 										continue
 									} else {
@@ -900,7 +925,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 					finishReason = "stop"
 				}
 				if autoDriveCount > 0 && finishReason != "tool_calls" {
-					log.Warnf("trae executor stream: auto-drive exhausted after %d attempt(s), turn still ends without a tool call (text=%q)", autoDriveCount, strings.TrimSpace(fullAssistantContent.String()))
+					log.Warnf("trae executor stream: auto-drive exhausted after %d attempt(s), turn still ends without a tool call (text=%q, reasoning_len=%d)", autoDriveCount, strings.TrimSpace(fullAssistantContent.String()), len(strings.TrimSpace(fullAssistantReasoning.String())))
 				}
 
 				doneChunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, "", "", finishReason)

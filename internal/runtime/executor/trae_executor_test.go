@@ -3,9 +3,11 @@ package executor
 import (
 	"context"
 	"encoding/json"
+	"io"
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync"
 	"sync/atomic"
 	"testing"
 	"time"
@@ -656,7 +658,131 @@ var (
 		`data: {"finish_reason":"stop"}` + "\n\n",
 		"data: [DONE]\n\n",
 	}
+	// Upstream deliberates but emits neither a reply nor a tool call. This is the
+	// shape that used to stall the agent loop in production.
+	traeReasoningOnlyScript = []string{
+		"event: output\n",
+		`data: {"reasoning":"用户希望我立刻调用下一个工具，让我想想该用哪个。"}` + "\n\n",
+		"event: done\n",
+		`data: {"finish_reason":"stop"}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
 )
+
+// traeAutoDriveRecordingServer behaves like traeAutoDriveServer but also keeps
+// every request body so the shape of the auto-drive continuation payload can be
+// asserted.
+func traeAutoDriveRecordingServer(t *testing.T, scripts [][]string, bodies *[][]byte, mu *sync.Mutex) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		body, _ := io.ReadAll(r.Body)
+		mu.Lock()
+		*bodies = append(*bodies, body)
+		idx := len(*bodies) - 1
+		mu.Unlock()
+		if idx >= len(scripts) {
+			idx = len(scripts) - 1
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		for _, l := range scripts[idx] {
+			_, _ = w.Write([]byte(l))
+			flusher.Flush()
+		}
+	}))
+}
+
+// A continuation that returns reasoning but no reply and no tool call is still a
+// stalled turn, so it must keep being driven instead of falling through to
+// end_turn — that fall-through is what showed up as a dead turn in Claude Code.
+func TestTraeAutoDriveRecoversReasoningOnlyContinuation(t *testing.T) {
+	var hits int32
+	server := traeAutoDriveServer(t, [][]string{traeDeferralScript, traeReasoningOnlyScript, traeToolCallScript}, &hits)
+	defer server.Close()
+
+	sse := traeAutoDriveClaudeStream(t, server.URL)
+
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("expected 3 upstream requests (original + 2 auto-drives), got %d", got)
+	}
+	if !strings.Contains(sse, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason tool_use after driving a reasoning-only turn, got:\n%s", sse)
+	}
+	if strings.Contains(sse, `"stop_reason":"end_turn"`) {
+		t.Errorf("reasoning-only continuation must not end the turn, got:\n%s", sse)
+	}
+}
+
+// Once a drive is under way the turn is already known to be stalled. A
+// continuation that answers with ordinary prose and still no tool call must keep
+// being driven, instead of being accepted as a finished turn just because the new
+// text does not read like a deferral.
+func TestTraeAutoDriveKeepsDrivingNonDeferralContinuation(t *testing.T) {
+	var hits int32
+	proseScript := []string{
+		"event: output\n",
+		`data: {"content":"好的，我明白了。"}` + "\n\n",
+		"event: done\n",
+		`data: {"finish_reason":"stop"}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	server := traeAutoDriveServer(t, [][]string{traeDeferralScript, proseScript, traeToolCallScript}, &hits)
+	defer server.Close()
+
+	sse := traeAutoDriveClaudeStream(t, server.URL)
+
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("expected 3 upstream requests (original + 2 auto-drives), got %d", got)
+	}
+	if !strings.Contains(sse, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason tool_use after driving a non-deferral continuation, got:\n%s", sse)
+	}
+}
+
+// Repeated drives must be rebuilt from the pre-drive payload: stacking each
+// attempt on top of the previous one duplicates the action rule and leaves two
+// user messages back to back, which degrades the continuation further.
+func TestTraeAutoDriveDoesNotStackDrivePrompts(t *testing.T) {
+	var (
+		mu     sync.Mutex
+		bodies [][]byte
+	)
+	server := traeAutoDriveRecordingServer(t,
+		[][]string{traeDeferralScript, traeReasoningOnlyScript, traeToolCallScript}, &bodies, &mu)
+	defer server.Close()
+
+	traeAutoDriveClaudeStream(t, server.URL)
+
+	mu.Lock()
+	defer mu.Unlock()
+	if len(bodies) != 3 {
+		t.Fatalf("expected 3 upstream requests, got %d", len(bodies))
+	}
+	for i, body := range bodies[1:] {
+		roles := gjson.GetBytes(body, "messages.#.role").Array()
+		if len(roles) == 0 {
+			t.Fatalf("drive %d: no messages in payload: %s", i+1, body)
+		}
+		for j := 1; j < len(roles); j++ {
+			if roles[j].String() == "user" && roles[j-1].String() == "user" {
+				t.Errorf("drive %d: consecutive user messages at index %d: %v", i+1, j, roles)
+			}
+		}
+		// The standing "[Agent Action Rule / 行动硬约束" reminder is always injected;
+		// only the drive prompt uses the 【...】 form, so count that one.
+		if got := strings.Count(string(body), "【Agent Action Rule"); got != 1 {
+			t.Errorf("drive %d: expected exactly 1 drive prompt in payload, got %d", i+1, got)
+		}
+	}
+	// Each drive restarts from the same base, so the payloads stay the same length.
+	if a, b := len(gjson.GetBytes(bodies[1], "messages").Array()), len(gjson.GetBytes(bodies[2], "messages").Array()); a != b {
+		t.Errorf("drive payloads grew across attempts: %d then %d messages", a, b)
+	}
+}
 
 // A transitional deferral must be auto-driven into a real tool call so that
 // Claude Code keeps the agent loop running instead of returning to the user.
