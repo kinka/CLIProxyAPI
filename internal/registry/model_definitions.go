@@ -843,6 +843,17 @@ var staticTraeModels = []*ModelInfo{
 		},
 	},
 	{
+		ID:                  "glm-5.3-flash",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.3 Flash",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "light", "high", "extra_high"},
+		},
+	},
+	{
 		ID:                  "deepseek-v4-pro-official",
 		Type:                "trae",
 		OwnedBy:             "deepseek",
@@ -852,6 +863,33 @@ var staticTraeModels = []*ModelInfo{
 		Thinking: &ThinkingSupport{
 			Levels: []string{"high", "max"},
 		},
+	},
+	{
+		ID:                  "deepseek-v4-flash-official",
+		Type:                "trae",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4 Flash Official",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+	{
+		ID:                  "qwen3.8-max",
+		Type:                "trae",
+		OwnedBy:             "qwen",
+		DisplayName:         "Qwen 3.8 Max",
+		ContextLength:       1000000,
+		MaxCompletionTokens: 64000,
+	},
+	{
+		ID:                  "doubao-seed-evolving",
+		Type:                "trae",
+		OwnedBy:             "bytedance",
+		DisplayName:         "Doubao Seed Evolving",
+		ContextLength:       256000,
+		MaxCompletionTokens: 64000,
 	},
 }
 

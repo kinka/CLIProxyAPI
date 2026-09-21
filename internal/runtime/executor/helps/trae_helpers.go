@@ -26,7 +26,7 @@ const (
 func ModelPrefersRawChat(model string) bool {
 	m := strings.ToLower(strings.TrimSpace(model))
 	switch m {
-	case "kimi-k3", "kimi-k2.8-preview", "kimi-k2.8", "deepseek-v4.1-flash", "glm-5.3":
+	case "kimi-k3", "kimi-k2.8-preview", "kimi-k2.8", "deepseek-v4.1-flash", "glm-5.3", "glm-5.3-flash", "deepseek-v4-flash-official", "qwen3.8-max", "qwen-3.8-max":
 		return true
 	}
 	return false
@@ -49,8 +49,16 @@ func ResolveTraeModel(model string) (functionName string, configName string) {
 		return "solo_agent", "DeepSeek-V4.1-Flash"
 	case "glm-5.3":
 		return "solo_agent", "glm-5.3"
+	case "glm-5.3-flash":
+		return "solo_agent", "glm-5.3-flash"
 	case "deepseek-v4-pro-official":
 		return "solo_agent", "DeepSeek-V4-Pro-Official"
+	case "deepseek-v4-flash-official":
+		return "solo_agent", "DeepSeek-V4-Flash-Official"
+	case "qwen3.8-max", "qwen-3.8-max":
+		return "solo_agent", "qwen3.8-max"
+	case "doubao-seed-evolving":
+		return "chat_v3", "Doubao-Seed-Evolving"
 	case "glm-5.2":
 		return "chat_v3", "glm-5.2"
 	case "glm-5.1":
