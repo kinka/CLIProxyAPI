@@ -399,6 +399,13 @@ func (s *Server) Stop(ctx context.Context) error {
 		s.codexLiveHandler.Close()
 	}
 	if errShutdown != nil {
+		// Shutdown gave up before every connection drained, so surviving keep-alive
+		// connections would keep reaching the handlers while the caller tears the
+		// model registry and plugin host down. Requests arriving on those connections
+		// come back as "unknown provider for model ...", so drop them outright.
+		if errClose := s.server.Close(); errClose != nil && !errors.Is(errClose, http.ErrServerClosed) {
+			log.Debugf("failed to force-close HTTP server after shutdown timeout: %v", errClose)
+		}
 		return fmt.Errorf("failed to shutdown HTTP server: %v", errShutdown)
 	}
 
