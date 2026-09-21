@@ -787,6 +787,72 @@ var staticTraeModels = []*ModelInfo{
 		ContextLength:       1000000,
 		MaxCompletionTokens: 64000,
 	},
+	{
+		ID:                  "kimi-k3",
+		Type:                "trae",
+		OwnedBy:             "moonshot",
+		DisplayName:         "Kimi K3",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high", "max"},
+		},
+	},
+	{
+		ID:                  "kimi-k2.8-preview",
+		Type:                "trae",
+		OwnedBy:             "moonshot",
+		DisplayName:         "Kimi K2.8 Preview",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high", "max"},
+		},
+	},
+	{
+		ID:                  "kimi-k2.8",
+		Type:                "trae",
+		OwnedBy:             "moonshot",
+		DisplayName:         "Kimi K2.8",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "low", "medium", "high", "max"},
+		},
+	},
+	{
+		ID:                  "deepseek-v4.1-flash",
+		Type:                "trae",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4.1 Flash",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
+	{
+		ID:                  "glm-5.3",
+		Type:                "trae",
+		OwnedBy:             "zhipu",
+		DisplayName:         "GLM-5.3",
+		ContextLength:       200000,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"none", "high"},
+		},
+	},
+	{
+		ID:                  "deepseek-v4-pro-official",
+		Type:                "trae",
+		OwnedBy:             "deepseek",
+		DisplayName:         "DeepSeek V4 Pro Official",
+		ContextLength:       1048576,
+		MaxCompletionTokens: 64000,
+		Thinking: &ThinkingSupport{
+			Levels: []string{"high", "max"},
+		},
+	},
 }
 
 // GetTraeModels returns the standard Trae model definitions.

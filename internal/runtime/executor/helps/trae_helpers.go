@@ -17,10 +17,20 @@ import (
 
 const (
 	TraeAppIDCN            = "6eefa01c-1036-4c7e-9ca5-d891f63bfcd8"
-	TraeDefaultVersionCN   = "3.3.67"
+	TraeDefaultVersionCN   = "3.3.99"
 	TraeDefaultVersionSG   = "3.5.51"
-	TraeDefaultVersionCode = "20260401"
+	TraeDefaultVersionCode = "20260901"
 )
+
+// ModelPrefersRawChat returns whether the requested model should preferably be routed via llm_raw_chat.
+func ModelPrefersRawChat(model string) bool {
+	m := strings.ToLower(strings.TrimSpace(model))
+	switch m {
+	case "kimi-k3", "kimi-k2.8-preview", "kimi-k2.8", "deepseek-v4.1-flash", "glm-5.3":
+		return true
+	}
+	return false
+}
 
 // ResolveTraeModel maps user-facing model names or aliases to Trae function and config_name.
 func ResolveTraeModel(model string) (functionName string, configName string) {
@@ -31,6 +41,16 @@ func ResolveTraeModel(model string) (functionName string, configName string) {
 
 	// Exact matches / direct configs
 	switch m {
+	case "kimi-k3":
+		return "solo_agent", "kimi-k3"
+	case "kimi-k2.8-preview", "kimi-k2.8":
+		return "solo_agent", "kimi-k2.8-preview"
+	case "deepseek-v4.1-flash":
+		return "solo_agent", "DeepSeek-V4.1-Flash"
+	case "glm-5.3":
+		return "solo_agent", "glm-5.3"
+	case "deepseek-v4-pro-official":
+		return "solo_agent", "DeepSeek-V4-Pro-Official"
 	case "glm-5.2":
 		return "chat_v3", "glm-5.2"
 	case "glm-5.1":
@@ -54,7 +74,7 @@ func ResolveTraeModel(model string) (functionName string, configName string) {
 	case "doubao-seed-2-1-turbo":
 		return "chat_v3", "Doubao-Seed-2.1-Turbo"
 	case "deepseek-v4-pro", "deepseek-v3", "deepseek-chat":
-		return "chat_v3", "DeepSeek-V4-Pro"
+		return "chat_v3", "deepseek-V4-Pro"
 	case "deepseek-v4-flash":
 		return "chat_v3", "DeepSeek-V4-Flash"
 	case "deepseek-r1", "deepseek-reasoner":
@@ -135,8 +155,10 @@ func ApplyTraeHeaders(req *http.Request, storage *traeauth.TraeTokenStorage, isS
 
 	req.Header.Set("x-app-id", TraeAppIDCN)
 	req.Header.Set("x-app-version", "default")
-	req.Header.Set("x-ide-version-code", TraeDefaultVersionCode)
-	req.Header.Set("x-app-version-code", TraeDefaultVersionCode)
+	versionCode := traeauth.DetectIdeVersionCode()
+	req.Header.Set("x-ide-version-code", versionCode)
+	req.Header.Set("x-app-version-code", versionCode)
+	req.Header.Set("x-plugin-channel", "icube-ai")
 	req.Header.Set("x-custom-trace-id", generateTraceID())
 
 	reqID := uuid.New().String()
@@ -169,10 +191,7 @@ func ApplyTraeHeaders(req *http.Request, storage *traeauth.TraeTokenStorage, isS
 	}
 	req.Header.Set("x-device-id", deviceID)
 
-	ideVersion := TraeDefaultVersionCN
-	if strings.EqualFold(storage.Edition, "sg") {
-		ideVersion = TraeDefaultVersionSG
-	}
+	ideVersion := traeauth.DetectIdeVersion(storage.Edition)
 	req.Header.Set("x-ide-version", ideVersion)
 	req.Header.Set("x-ide-version-type", "stable")
 	req.Header.Set("request-traffic-type", "prod")
@@ -279,6 +298,101 @@ func BuildTraeRequestBody(rawPayload []byte, requestedModel string, storage *tra
 	res, err := json.Marshal(outMap)
 	if err != nil {
 		return nil, "", fmt.Errorf("failed to marshal trae request body: %w", err)
+	}
+	return res, configName, nil
+}
+
+// BuildTraeRawChatRequestBody formats an incoming OpenAI chat completion payload into Trae /api/ide/v2/llm_raw_chat format.
+func BuildTraeRawChatRequestBody(rawPayload []byte, requestedModel string, storage *traeauth.TraeTokenStorage, stream bool) ([]byte, string, error) {
+	root := gjson.ParseBytes(rawPayload)
+	funcName, configName := ResolveTraeModel(requestedModel)
+	if funcName == "" || funcName == "chat_v3" {
+		funcName = "solo_agent"
+	}
+	if configName == "" {
+		configName = requestedModel
+	}
+
+	outMap := make(map[string]any)
+	outMap["function"] = funcName
+	outMap["raw_chat_function"] = funcName
+	outMap["stream"] = stream
+	outMap["session_id"] = "sess_" + strings.ReplaceAll(uuid.New().String(), "-", "")
+	outMap["config_name"] = configName
+	outMap["model_name"] = configName + "__dev"
+
+	if storage != nil {
+		if storage.UserID != "" {
+			outMap["user_id"] = storage.UserID
+		}
+		deviceID := storage.DeviceID
+		if deviceID == "" && storage.MachineID != "" {
+			deviceID = traeauth.HashDeviceID(storage.MachineID)
+		}
+		if deviceID != "" {
+			outMap["device_id"] = deviceID
+		}
+	}
+
+	// Format messages
+	rawMessages := root.Get("messages")
+	if rawMessages.Exists() && rawMessages.IsArray() {
+		var msgs []map[string]any
+		for _, m := range rawMessages.Array() {
+			role := m.Get("role").String()
+			contentVal := m.Get("content")
+			var contentBlocks []map[string]any
+
+			if contentVal.IsArray() {
+				for _, block := range contentVal.Array() {
+					if block.IsObject() {
+						t := block.Get("type").String()
+						if t == "text" {
+							contentBlocks = append(contentBlocks, map[string]any{
+								"type": "text",
+								"text": block.Get("text").String(),
+							})
+						} else {
+							contentBlocks = append(contentBlocks, block.Value().(map[string]any))
+						}
+					} else {
+						contentBlocks = append(contentBlocks, map[string]any{
+							"type": "text",
+							"text": block.String(),
+						})
+					}
+				}
+			} else {
+				contentBlocks = append(contentBlocks, map[string]any{
+					"type": "text",
+					"text": contentVal.String(),
+				})
+			}
+
+			msgs = append(msgs, map[string]any{
+				"role":    role,
+				"content": contentBlocks,
+			})
+		}
+		outMap["messages"] = msgs
+	}
+
+	if maxTokens := root.Get("max_tokens"); maxTokens.Exists() {
+		outMap["max_tokens"] = maxTokens.Int()
+	} else if maxCompTokens := root.Get("max_completion_tokens"); maxCompTokens.Exists() {
+		outMap["max_tokens"] = maxCompTokens.Int()
+	}
+
+	if temp := root.Get("temperature"); temp.Exists() {
+		outMap["temperature"] = temp.Float()
+	}
+	if topP := root.Get("top_p"); topP.Exists() {
+		outMap["top_p"] = topP.Float()
+	}
+
+	res, err := json.Marshal(outMap)
+	if err != nil {
+		return nil, "", fmt.Errorf("failed to marshal trae raw chat request body: %w", err)
 	}
 	return res, configName, nil
 }

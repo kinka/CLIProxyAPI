@@ -23,8 +23,98 @@ import (
 )
 
 const (
-	TraeChatPath = "/api/agent/v3/llm_utils_chat"
+	TraeChatPath    = "/api/agent/v3/llm_utils_chat"
+	TraeRawChatPath = "/api/ide/v2/llm_raw_chat"
 )
+
+type traeEndpointPlan struct {
+	name      string
+	path      string
+	isRaw     bool
+	buildBody func(rawPayload []byte, requestedModel string, storage *traeauth.TraeTokenStorage, stream bool) ([]byte, string, error)
+}
+
+func getTraeEndpointPlans(baseModel string) []traeEndpointPlan {
+	rawPlan := traeEndpointPlan{
+		name:      "llm_raw_chat",
+		path:      TraeRawChatPath,
+		isRaw:     true,
+		buildBody: helps.BuildTraeRawChatRequestBody,
+	}
+	utilsPlan := traeEndpointPlan{
+		name:      "llm_utils_chat",
+		path:      TraeChatPath,
+		isRaw:     false,
+		buildBody: helps.BuildTraeRequestBody,
+	}
+
+	if helps.ModelPrefersRawChat(baseModel) {
+		return []traeEndpointPlan{rawPlan, utilsPlan}
+	}
+	return []traeEndpointPlan{utilsPlan, rawPlan}
+}
+
+type streamPeekReader struct {
+	io.Reader
+	closer io.Closer
+}
+
+func (s *streamPeekReader) Close() error {
+	if s.closer != nil {
+		return s.closer.Close()
+	}
+	return nil
+}
+
+func peekFirstTraeEvent(resp *http.Response) (io.ReadCloser, *statusErr, error) {
+	if resp == nil || resp.Body == nil {
+		return nil, nil, fmt.Errorf("response body is nil")
+	}
+
+	reader := bufio.NewReader(resp.Body)
+	var peekedBytes bytes.Buffer
+	var currentEvent string
+	var hasContent bool
+	var streamErr *statusErr
+
+	for {
+		line, err := reader.ReadString('\n')
+		if len(line) > 0 {
+			peekedBytes.WriteString(line)
+			parsed := helps.ParseTraeSSELine(line, &currentEvent)
+			if parsed != nil {
+				if parsed.Type == "text" && (parsed.Content != "" || parsed.Reasoning != "") {
+					hasContent = true
+					break
+				}
+				if parsed.Type == "error" {
+					streamErr = &statusErr{code: mapTraeErrorCode(parsed.ErrorCode), msg: parsed.ErrorMessage}
+					break
+				}
+				if parsed.Type == "token_usage" || parsed.Type == "done" {
+					break
+				}
+			}
+		}
+		if err != nil {
+			if err == io.EOF {
+				break
+			}
+			return nil, nil, err
+		}
+	}
+
+	if streamErr != nil && !hasContent {
+		_ = resp.Body.Close()
+		return nil, streamErr, nil
+	}
+
+	combined := &streamPeekReader{
+		Reader: io.MultiReader(bytes.NewReader(peekedBytes.Bytes()), reader),
+		closer: resp.Body,
+	}
+	return combined, nil, nil
+}
 
 func mapTraeErrorCode(code int) int {
 	switch code {
@@ -214,99 +304,144 @@ func (e *TraeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	openAIPayload := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), false)
 
 	storage := traeStorageFromAuth(auth)
-	traeBody, _, err := helps.BuildTraeRequestBody(openAIPayload, baseModel, storage, true)
-	if err != nil {
-		return resp, fmt.Errorf("trae executor: failed to build request payload: %w", err)
-	}
-
 	apiHost := storage.Host
 	if apiHost == "" {
 		apiHost = traeauth.DefaultHostCN
 	}
 	apiHost = strings.TrimRight(apiHost, "/")
-	url := apiHost + TraeChatPath
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(traeBody))
-	if err != nil {
-		return resp, err
-	}
-	helps.ApplyTraeHeaders(httpReq, storage, true)
-	if auth != nil {
-		util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
-	}
-
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      traeBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
+	plans := getTraeEndpointPlans(baseModel)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return resp, err
-	}
-	defer func() {
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("trae executor: close response body error: %v", errClose)
-		}
-	}()
 
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		err = statusErr{code: httpResp.StatusCode, msg: string(b)}
-		return resp, err
-	}
-
-	// Parse SSE stream to accumulate full content and usage
-	scanner := bufio.NewScanner(httpResp.Body)
-	scanner.Buffer(nil, 1048576)
-	var currentEvent string
+	var lastErr error
+	var httpResp *http.Response
 	var fullContent strings.Builder
 	var fullReasoning strings.Builder
 	var lastUsage *helps.TraeTokenUsage
 
-	for scanner.Scan() {
-		line := scanner.Text()
-		helps.AppendAPIResponseChunk(ctx, e.cfg, []byte(line+"\n"))
-		parsed := helps.ParseTraeSSELine(line, &currentEvent)
-		if parsed == nil {
+	for i, plan := range plans {
+		traeBody, _, errBuild := plan.buildBody(openAIPayload, baseModel, storage, true)
+		if errBuild != nil {
+			lastErr = fmt.Errorf("trae executor: failed to build %s payload: %w", plan.name, errBuild)
 			continue
 		}
-		if parsed.Type == "text" {
-			if parsed.Content != "" {
-				fullContent.WriteString(parsed.Content)
+
+		url := apiHost + plan.path
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(traeBody))
+		if errReq != nil {
+			lastErr = errReq
+			continue
+		}
+		helps.ApplyTraeHeaders(httpReq, storage, true)
+		if plan.isRaw {
+			httpReq.Header.Set("X-App-Function", "solo_agent")
+			httpReq.Header.Set("X-Ide-Function", "solo_agent")
+		}
+		if auth != nil {
+			util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
+		}
+
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      traeBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		respDo, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			lastErr = errDo
+			continue
+		}
+
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, respDo.StatusCode, respDo.Header.Clone())
+		if respDo.StatusCode < 200 || respDo.StatusCode >= 300 {
+			b, _ := io.ReadAll(respDo.Body)
+			_ = respDo.Body.Close()
+			helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+			lastErr = statusErr{code: respDo.StatusCode, msg: string(b)}
+			if i < len(plans)-1 {
+				log.Warnf("trae executor: %s returned HTTP %d, falling back to next endpoint", plan.name, respDo.StatusCode)
+				continue
 			}
-			if parsed.Reasoning != "" {
-				fullReasoning.WriteString(parsed.Reasoning)
-			}
-		} else if parsed.Type == "token_usage" && parsed.TokenUsage != nil {
-			lastUsage = parsed.TokenUsage
-		} else if parsed.Type == "error" {
-			err = statusErr{code: mapTraeErrorCode(parsed.ErrorCode), msg: parsed.ErrorMessage}
+			err = lastErr
 			return resp, err
 		}
+
+		// Parse SSE stream
+		scanner := bufio.NewScanner(respDo.Body)
+		scanner.Buffer(nil, 1048576)
+		var currentEvent string
+		var streamErr *statusErr
+		fullContent.Reset()
+		fullReasoning.Reset()
+		lastUsage = nil
+
+		for scanner.Scan() {
+			line := scanner.Text()
+			helps.AppendAPIResponseChunk(ctx, e.cfg, []byte(line+"\n"))
+			parsed := helps.ParseTraeSSELine(line, &currentEvent)
+			if parsed == nil {
+				continue
+			}
+			if parsed.Type == "text" {
+				if parsed.Content != "" {
+					fullContent.WriteString(parsed.Content)
+				}
+				if parsed.Reasoning != "" {
+					fullReasoning.WriteString(parsed.Reasoning)
+				}
+			} else if parsed.Type == "token_usage" && parsed.TokenUsage != nil {
+				lastUsage = parsed.TokenUsage
+			} else if parsed.Type == "error" {
+				streamErr = &statusErr{code: mapTraeErrorCode(parsed.ErrorCode), msg: parsed.ErrorMessage}
+			}
+		}
+		_ = respDo.Body.Close()
+
+		if streamErr != nil && fullContent.Len() == 0 && fullReasoning.Len() == 0 {
+			lastErr = streamErr
+			if i < len(plans)-1 {
+				log.Warnf("trae executor: %s returned stream error: %v, falling back", plan.name, streamErr)
+				continue
+			}
+			err = lastErr
+			return resp, err
+		}
+
+		if errScan := scanner.Err(); errScan != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errScan)
+			lastErr = errScan
+			if i < len(plans)-1 {
+				continue
+			}
+			return resp, errScan
+		}
+
+		httpResp = respDo
+		break
 	}
 
-	if errScan := scanner.Err(); errScan != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, errScan)
-		return resp, errScan
+	if httpResp == nil {
+		if lastErr != nil {
+			err = lastErr
+			return resp, err
+		}
+		err = fmt.Errorf("trae executor: all chat endpoints failed")
+		return resp, err
 	}
 
 	compID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
@@ -340,61 +475,105 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	openAIPayload := helps.TranslateRequestWithCodexMultiAgentV2(ctx, opts.Headers, e.cfg, from, to, baseModel, bytes.Clone(req.Payload), true)
 
 	storage := traeStorageFromAuth(auth)
-	traeBody, _, err := helps.BuildTraeRequestBody(openAIPayload, baseModel, storage, true)
-	if err != nil {
-		return nil, fmt.Errorf("trae executor: failed to build request payload: %w", err)
-	}
-
 	apiHost := storage.Host
 	if apiHost == "" {
 		apiHost = traeauth.DefaultHostCN
 	}
 	apiHost = strings.TrimRight(apiHost, "/")
-	url := apiHost + TraeChatPath
 
-	httpReq, err := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(traeBody))
-	if err != nil {
-		return nil, err
-	}
-	helps.ApplyTraeHeaders(httpReq, storage, true)
-	if auth != nil {
-		util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
-	}
-
-	var authID, authLabel, authType, authValue string
-	if auth != nil {
-		authID = auth.ID
-		authLabel = auth.Label
-		authType, authValue = auth.AccountInfo()
-	}
-	helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
-		URL:       url,
-		Method:    http.MethodPost,
-		Headers:   httpReq.Header.Clone(),
-		Body:      traeBody,
-		Provider:  e.Identifier(),
-		AuthID:    authID,
-		AuthLabel: authLabel,
-		AuthType:  authType,
-		AuthValue: authValue,
-	})
-
+	plans := getTraeEndpointPlans(baseModel)
 	httpClient := helps.NewProxyAwareHTTPClient(ctx, e.cfg, auth, 0)
 	httpClient = reporter.TrackHTTPClient(httpClient)
-	httpResp, err := httpClient.Do(httpReq)
-	if err != nil {
-		helps.RecordAPIResponseError(ctx, e.cfg, err)
-		return nil, err
+
+	var streamBody io.ReadCloser
+	var lastErr error
+	var activeResp *http.Response
+
+	for i, plan := range plans {
+		traeBody, _, errBuild := plan.buildBody(openAIPayload, baseModel, storage, true)
+		if errBuild != nil {
+			lastErr = fmt.Errorf("trae executor: failed to build %s payload: %w", plan.name, errBuild)
+			continue
+		}
+
+		url := apiHost + plan.path
+		httpReq, errReq := http.NewRequestWithContext(ctx, http.MethodPost, url, bytes.NewReader(traeBody))
+		if errReq != nil {
+			lastErr = errReq
+			continue
+		}
+		helps.ApplyTraeHeaders(httpReq, storage, true)
+		if plan.isRaw {
+			httpReq.Header.Set("X-App-Function", "solo_agent")
+			httpReq.Header.Set("X-Ide-Function", "solo_agent")
+		}
+		if auth != nil {
+			util.ApplyCustomHeadersFromAttrs(httpReq, auth.Attributes)
+		}
+
+		var authID, authLabel, authType, authValue string
+		if auth != nil {
+			authID = auth.ID
+			authLabel = auth.Label
+			authType, authValue = auth.AccountInfo()
+		}
+		helps.RecordAPIRequest(ctx, e.cfg, helps.UpstreamRequestLog{
+			URL:       url,
+			Method:    http.MethodPost,
+			Headers:   httpReq.Header.Clone(),
+			Body:      traeBody,
+			Provider:  e.Identifier(),
+			AuthID:    authID,
+			AuthLabel: authLabel,
+			AuthType:  authType,
+			AuthValue: authValue,
+		})
+
+		httpResp, errDo := httpClient.Do(httpReq)
+		if errDo != nil {
+			helps.RecordAPIResponseError(ctx, e.cfg, errDo)
+			lastErr = errDo
+			continue
+		}
+
+		helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
+		if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
+			b, _ := io.ReadAll(httpResp.Body)
+			helps.AppendAPIResponseChunk(ctx, e.cfg, b)
+			_ = httpResp.Body.Close()
+			lastErr = statusErr{code: httpResp.StatusCode, msg: string(b)}
+			if i < len(plans)-1 {
+				log.Warnf("trae executor stream: %s HTTP %d, falling back", plan.name, httpResp.StatusCode)
+				continue
+			}
+			return nil, lastErr
+		}
+
+		peekedBody, peekErr, errPeek := peekFirstTraeEvent(httpResp)
+		if errPeek != nil {
+			_ = httpResp.Body.Close()
+			lastErr = errPeek
+			continue
+		}
+		if peekErr != nil {
+			lastErr = *peekErr
+			if i < len(plans)-1 {
+				log.Warnf("trae executor stream: %s returned early stream error: %v, falling back", plan.name, peekErr)
+				continue
+			}
+			return nil, lastErr
+		}
+
+		streamBody = peekedBody
+		activeResp = httpResp
+		break
 	}
 
-	helps.RecordAPIResponseMetadata(ctx, e.cfg, httpResp.StatusCode, httpResp.Header.Clone())
-	if httpResp.StatusCode < 200 || httpResp.StatusCode >= 300 {
-		b, _ := io.ReadAll(httpResp.Body)
-		helps.AppendAPIResponseChunk(ctx, e.cfg, b)
-		if errClose := httpResp.Body.Close(); errClose != nil {
-			log.Errorf("trae executor: close response body error: %v", errClose)
+	if streamBody == nil {
+		if lastErr != nil {
+			return nil, lastErr
 		}
-		return nil, statusErr{code: httpResp.StatusCode, msg: string(b)}
+		return nil, fmt.Errorf("trae executor: all chat stream endpoints failed")
 	}
 
 	out := make(chan cliproxyexecutor.StreamChunk)
@@ -403,12 +582,12 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	go func() {
 		defer close(out)
 		defer func() {
-			if errClose := httpResp.Body.Close(); errClose != nil {
+			if errClose := streamBody.Close(); errClose != nil {
 				log.Errorf("trae executor: close stream body error: %v", errClose)
 			}
 		}()
 
-		scanner := bufio.NewScanner(httpResp.Body)
+		scanner := bufio.NewScanner(streamBody)
 		scanner.Buffer(nil, 1048576)
 		claudeInputTokens := helps.NewClaudeInputTokenState(from, to, responseFormat, originalPayload)
 		var currentEvent string
@@ -499,7 +678,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 	}()
 
 	return &cliproxyexecutor.StreamResult{
-		Headers: httpResp.Header.Clone(),
+		Headers: activeResp.Header.Clone(),
 		Chunks:  out,
 	}, nil
 }

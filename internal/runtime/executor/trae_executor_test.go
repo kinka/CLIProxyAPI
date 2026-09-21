@@ -59,10 +59,16 @@ func TestTraeModelResolution(t *testing.T) {
 		{"glm-5", "chat_v3", "glm-5"},
 		{"doubao-seed-code", "chat_v3", "Doubao_1_6"},
 		{"doubao-1-6", "chat_v3", "Doubao_1_6"},
-		{"DeepSeek-V4-Pro", "chat_v3", "DeepSeek-V4-Pro"},
+		{"DeepSeek-V4-Pro", "chat_v3", "deepseek-V4-Pro"},
 		{"deepseek-r1", "chat_v3", "custom_model_deepseek_reasoner"},
 		{"qwen-3.7-plus", "chat_v3", "qwen-3.7-plus"},
 		{"kimi-k2.6", "chat_v3", "kimi-k2.6"},
+		{"kimi-k3", "solo_agent", "kimi-k3"},
+		{"kimi-k2.8-preview", "solo_agent", "kimi-k2.8-preview"},
+		{"kimi-k2.8", "solo_agent", "kimi-k2.8-preview"},
+		{"deepseek-v4.1-flash", "solo_agent", "DeepSeek-V4.1-Flash"},
+		{"glm-5.3", "solo_agent", "glm-5.3"},
+		{"deepseek-v4-pro-official", "solo_agent", "DeepSeek-V4-Pro-Official"},
 		{"claude-3-7-sonnet", "chat_v3", "glm-5.2"},
 		{"claude-3-5-haiku", "chat_v3", "glm-5.1"},
 		{"gpt-4o", "chat_v3", "custom_model_gpt-5"},
@@ -293,5 +299,136 @@ func TestTraeExecutorExecuteAndStream(t *testing.T) {
 
 	if len(receivedChunks) == 0 {
 		t.Fatalf("expected stream chunks, got none")
+	}
+}
+
+func TestTraeModelPrefersRawChat(t *testing.T) {
+	rawModels := []string{"kimi-k3", "kimi-k2.8-preview", "kimi-k2.8", "deepseek-v4.1-flash", "glm-5.3"}
+	for _, m := range rawModels {
+		if !helps.ModelPrefersRawChat(m) {
+			t.Errorf("expected ModelPrefersRawChat(%q) = true, got false", m)
+		}
+	}
+
+	nonRawModels := []string{"glm-5.2", "glm-5.1", "qwen-3.7-plus", "trae-auto", "claude-3-7-sonnet", "deepseek-v4-pro-official"}
+	for _, m := range nonRawModels {
+		if helps.ModelPrefersRawChat(m) {
+			t.Errorf("expected ModelPrefersRawChat(%q) = false, got true", m)
+		}
+	}
+}
+
+func TestBuildTraeRawChatRequestBody(t *testing.T) {
+	rawJSON := `{"messages":[{"role":"user","content":"ping"}],"model":"kimi-k3"}`
+	storage := &traeauth.TraeTokenStorage{
+		UserID:   "user-1",
+		DeviceID: "dev-1",
+	}
+	body, configName, err := helps.BuildTraeRawChatRequestBody([]byte(rawJSON), "kimi-k3", storage, true)
+	if err != nil {
+		t.Fatalf("BuildTraeRawChatRequestBody failed: %v", err)
+	}
+	if configName != "kimi-k3" {
+		t.Errorf("expected configName kimi-k3, got %s", configName)
+	}
+
+	var parsed map[string]any
+	if err := json.Unmarshal(body, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal raw chat body: %v", err)
+	}
+	if parsed["function"] != "solo_agent" || parsed["raw_chat_function"] != "solo_agent" {
+		t.Errorf("expected function and raw_chat_function = solo_agent, got %v, %v", parsed["function"], parsed["raw_chat_function"])
+	}
+	if parsed["config_name"] != "kimi-k3" || parsed["model_name"] != "kimi-k3__dev" {
+		t.Errorf("expected config_name kimi-k3, model_name kimi-k3__dev, got %v, %v", parsed["config_name"], parsed["model_name"])
+	}
+}
+
+func TestTraeExecutorFallbackOn4001(t *testing.T) {
+	var rawChatHit, chatV3Hit int
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+
+		if r.URL.Path == TraeRawChatPath {
+			rawChatHit++
+			// Simulate early 4001 error on raw chat
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: error\n"))
+			_, _ = w.Write([]byte(`data: {"error_code":4001,"error_message":"model not supported in raw chat"}` + "\n\n"))
+			flusher.Flush()
+			return
+		}
+
+		if r.URL.Path == TraeChatPath {
+			chatV3Hit++
+			w.WriteHeader(http.StatusOK)
+			_, _ = w.Write([]byte("event: output\n"))
+			_, _ = w.Write([]byte(`data: {"content":"fallback success"}` + "\n\n"))
+			_, _ = w.Write([]byte("event: done\n"))
+			_, _ = w.Write([]byte(`data: {"finish_reason":"stop"}` + "\n\n"))
+			_, _ = w.Write([]byte("data: [DONE]\n\n"))
+			flusher.Flush()
+			return
+		}
+
+		http.NotFound(w, r)
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{}
+	exec := NewTraeExecutor(cfg)
+	auth := &cliproxyauth.Auth{
+		ID:       "test-trae",
+		Provider: "trae",
+		Storage: &traeauth.TraeTokenStorage{
+			AccessToken: "test-token",
+			Host:        server.URL,
+		},
+	}
+
+	ctx := context.Background()
+	req := cliproxyexecutor.Request{
+		Model:   "kimi-k3", // prefers raw chat first
+		Payload: []byte(`{"messages":[{"role":"user","content":"hello"}]}`),
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+	}
+
+	// 1. Test streaming fallback
+	streamRes, err := exec.ExecuteStream(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("stream fallback failed: %v", err)
+	}
+	var chunks [][]byte
+	for c := range streamRes.Chunks {
+		if c.Err != nil {
+			t.Fatalf("unexpected chunk err: %v", c.Err)
+		}
+		chunks = append(chunks, c.Payload)
+	}
+	if len(chunks) == 0 {
+		t.Fatalf("expected chunks after fallback, got none")
+	}
+	if rawChatHit == 0 || chatV3Hit == 0 {
+		t.Errorf("expected both raw_chat and chat_v3 to be hit in fallback, got raw=%d, chat_v3=%d", rawChatHit, chatV3Hit)
+	}
+
+	// 2. Test non-streaming fallback
+	rawChatHit = 0
+	chatV3Hit = 0
+	resp, err := exec.Execute(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("non-stream fallback failed: %v", err)
+	}
+	if !strings.Contains(string(resp.Payload), "fallback success") {
+		t.Errorf("expected payload to contain fallback success, got %s", string(resp.Payload))
+	}
+	if rawChatHit == 0 || chatV3Hit == 0 {
+		t.Errorf("expected both raw_chat and chat_v3 to be hit in non-stream fallback, got raw=%d, chat_v3=%d", rawChatHit, chatV3Hit)
 	}
 }

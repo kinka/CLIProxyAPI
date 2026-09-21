@@ -92,6 +92,152 @@ func ReadStorageJSON(storagePath string) (map[string]any, error) {
 	return res, nil
 }
 
+// IsEnterpriseAccount checks whether the account contains enterprise / SaaS configurations.
+func IsEnterpriseAccount(account map[string]any) bool {
+	if account == nil {
+		return false
+	}
+	if boot, ok := account["saasBootConfig"].(map[string]any); ok {
+		var hosts []string
+		for _, k := range []string{"consoleHost", "apiHost", "remoteApi", "soloDomain"} {
+			if h, ok := boot[k].(string); ok && h != "" {
+				hosts = append(hosts, h)
+			}
+		}
+		allHosts := strings.ToLower(strings.Join(hosts, " "))
+		if strings.Contains(allHosts, "enterprise.trae") {
+			return true
+		}
+	}
+	tenantID, _ := account["tenant_id"].(string)
+	tenantName, _ := account["tenant_name"].(string)
+	if tenantID != "" && tenantName != "" {
+		return true
+	}
+	return false
+}
+
+// EnterpriseAuthHost extracts the enterprise host from saasBootConfig.
+func EnterpriseAuthHost(account map[string]any) string {
+	if account == nil {
+		return ""
+	}
+	if boot, ok := account["saasBootConfig"].(map[string]any); ok {
+		if aHost, ok := boot["apiHost"].(string); ok && strings.TrimSpace(aHost) != "" {
+			return strings.TrimRight(strings.TrimSpace(aHost), "/")
+		}
+		if cHost, ok := boot["consoleHost"].(string); ok && strings.TrimSpace(cHost) != "" {
+			return strings.TrimRight(strings.TrimSpace(cHost), "/")
+		}
+	}
+	return ""
+}
+
+// DetectIdeAppRoot returns the path to the Trae IDE app directory if available.
+func DetectIdeAppRoot(edition string) string {
+	ed := strings.ToLower(strings.TrimSpace(edition))
+	if runtime.GOOS == "darwin" {
+		appName := "Trae CN.app"
+		if ed == "sg" {
+			appName = "Trae.app"
+		}
+		p := filepath.Join("/Applications", appName, "Contents", "Resources", "app")
+		if _, err := os.Stat(p); err == nil {
+			return p
+		}
+		// Fallback to the other app if present
+		altApp := "Trae.app"
+		if ed == "sg" {
+			altApp = "Trae CN.app"
+		}
+		altP := filepath.Join("/Applications", altApp, "Contents", "Resources", "app")
+		if _, err := os.Stat(altP); err == nil {
+			return altP
+		}
+	} else if runtime.GOOS == "windows" {
+		localAppData := os.Getenv("LOCALAPPDATA")
+		if localAppData != "" {
+			subDir := "Trae-CN"
+			if ed == "sg" {
+				subDir = "Trae"
+			}
+			p := filepath.Join(localAppData, "Programs", subDir)
+			if _, err := os.Stat(p); err == nil {
+				return p
+			}
+		}
+	}
+	return ""
+}
+
+// DetectIdeVersion attempts to detect the installed Trae IDE version from application manifests.
+func DetectIdeVersion(edition string) string {
+	appRoot := DetectIdeAppRoot(edition)
+	if appRoot != "" {
+		// Try product.json
+		productJSONPath := filepath.Join(appRoot, "product.json")
+		if data, err := os.ReadFile(productJSONPath); err == nil {
+			var prod struct {
+				AppVersion string `json:"appVersion"`
+				Version    string `json:"version"`
+			}
+			if err := json.Unmarshal(data, &prod); err == nil {
+				if prod.AppVersion != "" {
+					return prod.AppVersion
+				}
+				if prod.Version != "" {
+					return prod.Version
+				}
+			}
+		}
+		// Try manifest.json
+		manifestPath := filepath.Join(appRoot, "manifest.json")
+		if data, err := os.ReadFile(manifestPath); err == nil {
+			var man struct {
+				AppVersion string `json:"appVersion"`
+				Version    string `json:"version"`
+			}
+			if err := json.Unmarshal(data, &man); err == nil {
+				if man.AppVersion != "" {
+					return man.AppVersion
+				}
+				if man.Version != "" {
+					return man.Version
+				}
+			}
+		}
+	}
+
+	if strings.EqualFold(edition, "sg") {
+		return "3.5.51"
+	}
+	return "3.3.99"
+}
+
+// DetectIdeVersionCode returns the latest IDE version code (defaults to 20260901).
+func DetectIdeVersionCode() string {
+	if envCode := os.Getenv("TRAE_IDE_VERSION_CODE"); envCode != "" {
+		return envCode
+	}
+	defaultCode := "20260901"
+	appRoot := DetectIdeAppRoot("")
+	if appRoot != "" {
+		pkgPath := filepath.Join(appRoot, "extensions", "ai-completion", "package.json")
+		if data, err := os.ReadFile(pkgPath); err == nil {
+			var pkg struct {
+				VersionCode any `json:"versionCode"`
+			}
+			if err := json.Unmarshal(data, &pkg); err == nil && pkg.VersionCode != nil {
+				codeStr := fmt.Sprintf("%v", pkg.VersionCode)
+				if codeStr > defaultCode {
+					return codeStr
+				}
+			}
+		}
+	}
+	return defaultCode
+}
+
 type authPayload struct {
 	Token            string         `json:"token"`
 	RefreshToken     string         `json:"refreshToken"`
@@ -122,7 +268,11 @@ func LoadAuthFromLocalTrae(dataDir string, edition string) (*TraeTokenStorage, e
 	for _, currentEd := range editions {
 		dir := dataDir
 		if dir == "" {
-			dir = DefaultDataDirForEdition(currentEd)
+			if envDir := os.Getenv("TRAE_DATA_DIR"); envDir != "" {
+				dir = envDir
+			} else {
+				dir = DefaultDataDirForEdition(currentEd)
+			}
 		}
 		storagePath := StorageJSONPath(dir)
 		storage, err := ReadStorageJSON(storagePath)
@@ -197,13 +347,22 @@ func LoadAuthFromLocalTrae(dataDir string, edition string) (*TraeTokenStorage, e
 			apiHost = DefaultHostUS
 		}
 
-		// Check enterprise boot config
-		if boot, ok := payload.Account["saasBootConfig"].(map[string]any); ok {
-			if aHost, ok := boot["apiHost"].(string); ok && aHost != "" {
-				authHost = strings.TrimRight(aHost, "/")
-			} else if cHost, ok := boot["consoleHost"].(string); ok && cHost != "" {
-				authHost = strings.TrimRight(cHost, "/")
+		// Check enterprise / SaaS account
+		if IsEnterpriseAccount(payload.Account) {
+			entHost := EnterpriseAuthHost(payload.Account)
+			if entHost != "" {
+				authHost = entHost
+				apiHost = entHost
 			}
+			currentEd = "enterprise"
+		}
+
+		// Allow manual environment overrides
+		if envApiHost := os.Getenv("TRAE_API_HOST"); envApiHost != "" {
+			apiHost = strings.TrimRight(envApiHost, "/")
+		}
+		if envAuthHost := os.Getenv("TRAE_AUTH_HOST"); envAuthHost != "" {
+			authHost = strings.TrimRight(envAuthHost, "/")
 		}
 
 		return &TraeTokenStorage{
