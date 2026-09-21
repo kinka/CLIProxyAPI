@@ -6,6 +6,7 @@ import (
 	"encoding/json"
 	"fmt"
 	"net/http"
+	"regexp"
 	"runtime"
 	"strings"
 	"time"
@@ -209,6 +210,388 @@ func ApplyTraeHeaders(req *http.Request, storage *traeauth.TraeTokenStorage, isS
 	}
 }
 
+// TraeToolDefinition represents a tool available to the model.
+type TraeToolDefinition struct {
+	Name        string
+	Description string
+	Parameters  []string
+}
+
+// BuildToolMap builds a lookup table mapping lowercase and common aliases to original tool names.
+func BuildToolMap(tools []TraeToolDefinition) map[string]string {
+	m := make(map[string]string)
+	for _, t := range tools {
+		if t.Name == "" {
+			continue
+		}
+		lower := strings.ToLower(t.Name)
+		clean := strings.ReplaceAll(lower, "_", "")
+		m[lower] = t.Name
+		m[clean] = t.Name
+		m[t.Name] = t.Name
+
+		switch clean {
+		case "bash", "executecommand", "runcommand":
+			m["bash"] = t.Name
+			m["execute_command"] = t.Name
+			m["run_command"] = t.Name
+		case "read", "readfile":
+			m["read"] = t.Name
+			m["read_file"] = t.Name
+			m["readfile"] = t.Name
+		case "write", "writefile":
+			m["write"] = t.Name
+			m["write_file"] = t.Name
+			m["writefile"] = t.Name
+		case "edit", "editfile":
+			m["edit"] = t.Name
+			m["edit_file"] = t.Name
+			m["editfile"] = t.Name
+		case "multiedit":
+			m["multiedit"] = t.Name
+			m["multi_edit"] = t.Name
+		case "glob", "listdir", "listfiles":
+			m["glob"] = t.Name
+			m["listdir"] = t.Name
+			m["list_files"] = t.Name
+		case "grep", "searchfiles":
+			m["grep"] = t.Name
+			m["search_files"] = t.Name
+		case "webfetch", "fetchurl":
+			m["webfetch"] = t.Name
+			m["fetch_url"] = t.Name
+			m["web_fetch"] = t.Name
+		case "websearch", "searchinternet":
+			m["websearch"] = t.Name
+			m["search_internet"] = t.Name
+			m["web_search"] = t.Name
+		}
+	}
+	return m
+}
+
+// ExtractToolMapFromPayload parses tool declarations from an incoming JSON payload and builds a tool mapping.
+func ExtractToolMapFromPayload(rawPayload []byte, fallbackPayload []byte) map[string]string {
+	root := gjson.ParseBytes(rawPayload)
+	toolsResult := root.Get("tools")
+	if (!toolsResult.Exists() || !toolsResult.IsArray() || len(toolsResult.Array()) == 0) && len(fallbackPayload) > 0 {
+		fbRoot := gjson.ParseBytes(fallbackPayload)
+		if fbTools := fbRoot.Get("tools"); fbTools.Exists() && fbTools.IsArray() {
+			toolsResult = fbTools
+		}
+	}
+
+	if !toolsResult.Exists() || !toolsResult.IsArray() {
+		return make(map[string]string)
+	}
+
+	var toolDefs []TraeToolDefinition
+	for _, t := range toolsResult.Array() {
+		name := t.Get("function.name").String()
+		if name == "" {
+			name = t.Get("name").String()
+		}
+		if name == "" {
+			continue
+		}
+		desc := t.Get("function.description").String()
+		if desc == "" {
+			desc = t.Get("description").String()
+		}
+		if len(desc) > 200 {
+			desc = desc[:200]
+		}
+
+		var paramNames []string
+		props := t.Get("function.parameters.properties")
+		if !props.Exists() {
+			props = t.Get("input_schema.properties")
+		}
+		if props.Exists() && props.IsObject() {
+			props.ForEach(func(key, _ gjson.Result) bool {
+				paramNames = append(paramNames, key.String())
+				return true
+			})
+		}
+
+		toolDefs = append(toolDefs, TraeToolDefinition{
+			Name:        name,
+			Description: desc,
+			Parameters:  paramNames,
+		})
+	}
+
+	return BuildToolMap(toolDefs)
+}
+
+// FormatTraeMessagesWithTools extracts messages from OpenAI payload, handles tool results / tool calls,
+// and injects tool system prompts to bridge agent execution.
+func FormatTraeMessagesWithTools(root gjson.Result) ([]map[string]any, map[string]string) {
+	rawMessages := root.Get("messages")
+	if !rawMessages.Exists() || !rawMessages.IsArray() {
+		return nil, nil
+	}
+
+	toolsResult := root.Get("tools")
+	var toolDefs []TraeToolDefinition
+	if toolsResult.Exists() && toolsResult.IsArray() {
+		for _, t := range toolsResult.Array() {
+			name := t.Get("function.name").String()
+			if name == "" {
+				name = t.Get("name").String()
+			}
+			if name == "" {
+				continue
+			}
+			desc := t.Get("function.description").String()
+			if desc == "" {
+				desc = t.Get("description").String()
+			}
+			if len(desc) > 200 {
+				desc = desc[:200]
+			}
+
+			var paramNames []string
+			props := t.Get("function.parameters.properties")
+			if !props.Exists() {
+				props = t.Get("input_schema.properties")
+			}
+			if props.Exists() && props.IsObject() {
+				props.ForEach(func(key, _ gjson.Result) bool {
+					paramNames = append(paramNames, key.String())
+					return true
+				})
+			}
+
+			toolDefs = append(toolDefs, TraeToolDefinition{
+				Name:        name,
+				Description: desc,
+				Parameters:  paramNames,
+			})
+		}
+	}
+	toolMap := BuildToolMap(toolDefs)
+
+	// Detect if this is a tool continuation turn (tool results sent back)
+	isToolContinuation := false
+	callIDToName := make(map[string]string)
+	for _, m := range rawMessages.Array() {
+		role := m.Get("role").String()
+		if role == "tool" || m.Get("tool_call_id").Exists() {
+			isToolContinuation = true
+		}
+		if role == "assistant" && m.Get("tool_calls").Exists() {
+			isToolContinuation = true
+			for _, tc := range m.Get("tool_calls").Array() {
+				tcID := tc.Get("id").String()
+				tcName := tc.Get("function.name").String()
+				if tcName == "" {
+					tcName = tc.Get("name").String()
+				}
+				if tcID != "" && tcName != "" {
+					callIDToName[tcID] = tcName
+				}
+			}
+		}
+		cStr := m.Get("content").String()
+		if strings.Contains(cStr, "<tool_result") || strings.Contains(cStr, "tool_result") {
+			isToolContinuation = true
+		}
+	}
+
+	var msgs []map[string]any
+	systemMsgIndex := -1
+
+	for _, m := range rawMessages.Array() {
+		role := m.Get("role").String()
+		contentVal := m.Get("content")
+		var contentBlocks []map[string]any
+
+		if role == "tool" {
+			// Convert OpenAI role="tool" to role="user" with <tool_result> tag
+			callID := m.Get("tool_call_id").String()
+			forName := callID
+			if mapped, ok := callIDToName[callID]; ok && mapped != "" {
+				forName = mapped
+			}
+			resultText := contentVal.String()
+			wrapped := fmt.Sprintf("<tool_result for=\"%s\">\n%s\n</tool_result>", forName, resultText)
+			msgs = append(msgs, map[string]any{
+				"role": "user",
+				"content": []map[string]any{
+					{"type": "text", "text": wrapped},
+				},
+			})
+			continue
+		}
+
+		if contentVal.IsArray() {
+			for _, block := range contentVal.Array() {
+				if block.IsObject() {
+					t := block.Get("type").String()
+					if t == "text" {
+						contentBlocks = append(contentBlocks, map[string]any{
+							"type": "text",
+							"text": block.Get("text").String(),
+						})
+					} else {
+						contentBlocks = append(contentBlocks, block.Value().(map[string]any))
+					}
+				} else {
+					contentBlocks = append(contentBlocks, map[string]any{
+						"type": "text",
+						"text": block.String(),
+					})
+				}
+			}
+		} else {
+			textStr := contentVal.String()
+			if textStr != "" || role != "assistant" {
+				contentBlocks = append(contentBlocks, map[string]any{
+					"type": "text",
+					"text": textStr,
+				})
+			}
+		}
+
+		// If assistant message had tool_calls, ensure they are represented in <toolcall> format in content
+		if role == "assistant" {
+			toolCalls := m.Get("tool_calls")
+			if toolCalls.Exists() && toolCalls.IsArray() {
+				var tcTags strings.Builder
+				for _, tc := range toolCalls.Array() {
+					tcName := tc.Get("function.name").String()
+					if tcName == "" {
+						tcName = tc.Get("name").String()
+					}
+					tcArgs := tc.Get("function.arguments").String()
+					if tcArgs == "" {
+						tcArgs = tc.Get("arguments").String()
+					}
+					if tcArgs == "" {
+						tcArgs = "{}"
+					}
+					var paramsObj any
+					if err := json.Unmarshal([]byte(tcArgs), &paramsObj); err != nil {
+						paramsObj = tcArgs
+					}
+					tcPayload, _ := json.Marshal(map[string]any{
+						"name":   tcName,
+						"params": paramsObj,
+					})
+					tcTags.WriteString(fmt.Sprintf("\n<toolcall>%s</toolcall>", string(tcPayload)))
+				}
+				if tcTags.Len() > 0 {
+					contentBlocks = append(contentBlocks, map[string]any{
+						"type": "text",
+						"text": tcTags.String(),
+					})
+				}
+			}
+		}
+
+		if len(contentBlocks) > 0 {
+			var merged []map[string]any
+			var curText strings.Builder
+			for _, b := range contentBlocks {
+				if b["type"] == "text" {
+					if t, ok := b["text"].(string); ok {
+						curText.WriteString(t)
+					}
+				} else {
+					if curText.Len() > 0 {
+						merged = append(merged, map[string]any{
+							"type": "text",
+							"text": curText.String(),
+						})
+						curText.Reset()
+					}
+					merged = append(merged, b)
+				}
+			}
+			if curText.Len() > 0 {
+				merged = append(merged, map[string]any{
+					"type": "text",
+					"text": curText.String(),
+				})
+			}
+			contentBlocks = merged
+		}
+
+		if role == "system" && systemMsgIndex == -1 {
+			systemMsgIndex = len(msgs)
+		}
+
+		msgs = append(msgs, map[string]any{
+			"role":    role,
+			"content": contentBlocks,
+		})
+	}
+
+	// Build tool system prompt
+	var toolSystemMsg string
+	if len(toolDefs) > 0 {
+		var sb strings.Builder
+		sb.WriteString("\n\n<available_tools>\n")
+		sb.WriteString("You have access to the following tools. To call a tool, output a toolcall block in JSON format:\n")
+		sb.WriteString("<toolcall>{\"name\": \"ToolName\", \"params\": {\"param1\": \"value1\"}}</toolcall>\n\n")
+		sb.WriteString("CRITICAL RULES:\n")
+		sb.WriteString("- The <toolcall> block MUST contain valid JSON with \"name\" and \"params\" keys\n")
+		sb.WriteString("- Do NOT use XML attributes like: ToolName param=\"value\"\n")
+		sb.WriteString("- Do NOT use <arg_key>/<arg_value> tags\n")
+		sb.WriteString("- Use the EXACT tool names listed below (case-sensitive)\n")
+		sb.WriteString("- Output the <toolcall> block directly in your response, not inside other tags\n\n")
+		sb.WriteString("Available tools:\n")
+		for _, td := range toolDefs {
+			paramsStr := strings.Join(td.Parameters, ", ")
+			sb.WriteString(fmt.Sprintf("- %s(%s): %s\n", td.Name, paramsStr, td.Description))
+		}
+		if isToolContinuation {
+			sb.WriteString("\nCRITICAL: You are in a multi-turn tool use conversation. The user has sent back tool results from your previous tool calls. You MUST:\n")
+			sb.WriteString("1. Analyze the tool results carefully\n")
+			sb.WriteString("2. If you need more information, call another tool using <toolcall> format\n")
+			sb.WriteString("3. If you have enough information to answer the user's question, provide your final answer as text\n")
+			sb.WriteString("4. Do NOT just say \"I've completed the task\" without providing the actual information or result the user requested\n")
+			sb.WriteString("5. Do NOT stop prematurely - continue working until the task is fully complete\n")
+		}
+		sb.WriteString("</available_tools>")
+		toolSystemMsg = sb.String()
+	} else if isToolContinuation {
+		toolSystemMsg = "\n\nIMPORTANT: You are in a multi-turn tool use conversation. The user has sent back tool results. You MUST analyze the results and continue working. If you need more information, call another tool. Otherwise, provide a complete answer. Do NOT stop prematurely."
+	}
+
+	// Inject tool system prompt
+	if toolSystemMsg != "" {
+		if systemMsgIndex >= 0 && systemMsgIndex < len(msgs) {
+			sysBlocks, ok := msgs[systemMsgIndex]["content"].([]map[string]any)
+			if ok && len(sysBlocks) > 0 {
+				if lastText, hasText := sysBlocks[len(sysBlocks)-1]["text"].(string); hasText {
+					sysBlocks[len(sysBlocks)-1]["text"] = lastText + toolSystemMsg
+				} else {
+					sysBlocks = append(sysBlocks, map[string]any{
+						"type": "text",
+						"text": toolSystemMsg,
+					})
+				}
+				msgs[systemMsgIndex]["content"] = sysBlocks
+			} else {
+				msgs[systemMsgIndex]["content"] = []map[string]any{
+					{"type": "text", "text": toolSystemMsg},
+				}
+			}
+		} else {
+			msgs = append([]map[string]any{{
+				"role": "system",
+				"content": []map[string]any{
+					{"type": "text", "text": toolSystemMsg},
+				},
+			}}, msgs...)
+		}
+	}
+
+	return msgs, toolMap
+}
+
 // BuildTraeRequestBody formats an incoming OpenAI chat completion payload into Trae llm_utils_chat format.
 func BuildTraeRequestBody(rawPayload []byte, requestedModel string, storage *traeauth.TraeTokenStorage, stream bool) ([]byte, string, error) {
 	root := gjson.ParseBytes(rawPayload)
@@ -237,47 +620,9 @@ func BuildTraeRequestBody(rawPayload []byte, requestedModel string, storage *tra
 		outMap["model"] = configName
 	}
 
-	// Format messages
-	rawMessages := root.Get("messages")
-	if rawMessages.Exists() && rawMessages.IsArray() {
-		var msgs []map[string]any
-		for _, m := range rawMessages.Array() {
-			role := m.Get("role").String()
-			contentVal := m.Get("content")
-			var contentBlocks []map[string]any
-
-			if contentVal.IsArray() {
-				for _, block := range contentVal.Array() {
-					if block.IsObject() {
-						t := block.Get("type").String()
-						if t == "text" {
-							contentBlocks = append(contentBlocks, map[string]any{
-								"type": "text",
-								"text": block.Get("text").String(),
-							})
-						} else {
-							// pass through other blocks
-							contentBlocks = append(contentBlocks, block.Value().(map[string]any))
-						}
-					} else {
-						contentBlocks = append(contentBlocks, map[string]any{
-							"type": "text",
-							"text": block.String(),
-						})
-					}
-				}
-			} else {
-				contentBlocks = append(contentBlocks, map[string]any{
-					"type": "text",
-					"text": contentVal.String(),
-				})
-			}
-
-			msgs = append(msgs, map[string]any{
-				"role":    role,
-				"content": contentBlocks,
-			})
-		}
+	// Format messages with tools injected
+	msgs, _ := FormatTraeMessagesWithTools(root)
+	if msgs != nil {
 		outMap["messages"] = msgs
 	}
 
@@ -342,46 +687,9 @@ func BuildTraeRawChatRequestBody(rawPayload []byte, requestedModel string, stora
 		}
 	}
 
-	// Format messages
-	rawMessages := root.Get("messages")
-	if rawMessages.Exists() && rawMessages.IsArray() {
-		var msgs []map[string]any
-		for _, m := range rawMessages.Array() {
-			role := m.Get("role").String()
-			contentVal := m.Get("content")
-			var contentBlocks []map[string]any
-
-			if contentVal.IsArray() {
-				for _, block := range contentVal.Array() {
-					if block.IsObject() {
-						t := block.Get("type").String()
-						if t == "text" {
-							contentBlocks = append(contentBlocks, map[string]any{
-								"type": "text",
-								"text": block.Get("text").String(),
-							})
-						} else {
-							contentBlocks = append(contentBlocks, block.Value().(map[string]any))
-						}
-					} else {
-						contentBlocks = append(contentBlocks, map[string]any{
-							"type": "text",
-							"text": block.String(),
-						})
-					}
-				}
-			} else {
-				contentBlocks = append(contentBlocks, map[string]any{
-					"type": "text",
-					"text": contentVal.String(),
-				})
-			}
-
-			msgs = append(msgs, map[string]any{
-				"role":    role,
-				"content": contentBlocks,
-			})
-		}
+	// Format messages with tools injected
+	msgs, _ := FormatTraeMessagesWithTools(root)
+	if msgs != nil {
 		outMap["messages"] = msgs
 	}
 
@@ -555,6 +863,11 @@ func FormatOpenAIStreamChunk(id, model, content, reasoning, finishReason string)
 
 // FormatOpenAINonStreamResponse constructs a non-streaming chat completion JSON response in OpenAI format.
 func FormatOpenAINonStreamResponse(id, model, fullContent, fullReasoning string, usage *TraeTokenUsage) []byte {
+	return FormatOpenAINonStreamResponseWithTools(id, model, fullContent, fullReasoning, nil, usage)
+}
+
+// FormatOpenAINonStreamResponseWithTools constructs a non-streaming chat completion JSON response including tool calls.
+func FormatOpenAINonStreamResponseWithTools(id, model, fullContent, fullReasoning string, toolCalls []TraeToolCall, usage *TraeTokenUsage) []byte {
 	msg := map[string]any{
 		"role":    "assistant",
 		"content": fullContent,
@@ -563,10 +876,28 @@ func FormatOpenAINonStreamResponse(id, model, fullContent, fullReasoning string,
 		msg["reasoning_content"] = fullReasoning
 	}
 
+	finishReason := "stop"
+	if len(toolCalls) > 0 {
+		finishReason = "tool_calls"
+		var tcList []map[string]any
+		for _, tc := range toolCalls {
+			tcList = append(tcList, map[string]any{
+				"index": tc.Index,
+				"id":    tc.ID,
+				"type":  "function",
+				"function": map[string]any{
+					"name":      tc.Name,
+					"arguments": tc.Args,
+				},
+			})
+		}
+		msg["tool_calls"] = tcList
+	}
+
 	choice := map[string]any{
 		"index":         0,
 		"message":       msg,
-		"finish_reason": "stop",
+		"finish_reason": finishReason,
 	}
 
 	respObj := map[string]any{
@@ -593,4 +924,423 @@ func FormatOpenAINonStreamResponse(id, model, fullContent, fullReasoning string,
 
 	b, _ := json.Marshal(respObj)
 	return b
+}
+
+// TraeToolCall represents a single parsed tool call from model output.
+type TraeToolCall struct {
+	Index int    `json:"index"`
+	ID    string `json:"id"`
+	Name  string `json:"name"`
+	Args  string `json:"arguments"`
+}
+
+var (
+	xmlAttrRegex    = regexp.MustCompile(`(\w+)\s*=\s*["']([^"']*?)["']`)
+	xmlArgKeyRegex  = regexp.MustCompile(`(?:<arg_key>)?(\w+)\s*</arg_key>\s*<arg_value>([\s\S]*?)</arg_value>`)
+	xmlParamRegex   = regexp.MustCompile(`<param\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)</param>`)
+	reToolCall      = regexp.MustCompile(`(?s)<(?:tool_call|toolcall)(?:\s+name=["']([^"']+)["'])?[^>]*>(.*?)</(?:tool_call|toolcall)>`)
+	reLooseToolCall = regexp.MustCompile(`(?s)<(?:tool_call|toolcall)(?:\s+name=["']([^"']+)["'])?[^>]*>(.*?)(?:</(?:tool_call|toolcall)>|$)`)
+)
+
+func buildToolCall(rawName string, params any, toolMap map[string]string) TraeToolCall {
+	rawName = strings.TrimSpace(rawName)
+	mappedName := rawName
+	if toolMap != nil {
+		if m, ok := toolMap[strings.ToLower(rawName)]; ok && m != "" {
+			mappedName = m
+		} else if m, ok := toolMap[rawName]; ok && m != "" {
+			mappedName = m
+		}
+	}
+
+	var argsStr string
+	if params == nil {
+		argsStr = "{}"
+	} else if str, ok := params.(string); ok {
+		trimmed := strings.TrimSpace(str)
+		if strings.HasPrefix(trimmed, "{") && strings.HasSuffix(trimmed, "}") {
+			argsStr = trimmed
+		} else {
+			b, _ := json.Marshal(map[string]any{"_raw": str})
+			argsStr = string(b)
+		}
+	} else {
+		b, err := json.Marshal(params)
+		if err != nil {
+			argsStr = "{}"
+		} else {
+			argsStr = string(b)
+		}
+	}
+
+	u := strings.ReplaceAll(uuid.New().String(), "-", "")
+	if len(u) > 24 {
+		u = u[:24]
+	}
+	return TraeToolCall{
+		ID:   "call_" + u,
+		Name: mappedName,
+		Args: argsStr,
+	}
+}
+
+// ParseToolcallContent parses raw tool call text (JSON or XML) into a TraeToolCall.
+func ParseToolcallContent(inner string, toolMap map[string]string) (TraeToolCall, bool) {
+	trimmed := strings.TrimSpace(inner)
+	if trimmed == "" {
+		return TraeToolCall{}, false
+	}
+
+	// 1. Direct JSON parse
+	var jsonMap map[string]any
+	if err := json.Unmarshal([]byte(trimmed), &jsonMap); err == nil {
+		name := ""
+		if n, ok := jsonMap["name"].(string); ok && n != "" {
+			name = n
+		} else if fn, ok := jsonMap["function"].(map[string]any); ok {
+			if n, ok := fn["name"].(string); ok {
+				name = n
+			}
+		}
+
+		var params any
+		if p, ok := jsonMap["params"]; ok {
+			params = p
+		} else if a, ok := jsonMap["arguments"]; ok {
+			params = a
+		} else if in, ok := jsonMap["input"]; ok {
+			params = in
+		} else if fn, ok := jsonMap["function"].(map[string]any); ok {
+			if a, ok := fn["arguments"]; ok {
+				params = a
+			}
+		}
+
+		if name != "" {
+			return buildToolCall(name, params, toolMap), true
+		}
+	}
+
+	// 2. Extract embedded JSON {...}
+	idxStart := strings.Index(trimmed, "{")
+	idxEnd := strings.LastIndex(trimmed, "}")
+	if idxStart >= 0 && idxEnd > idxStart {
+		jsonPart := trimmed[idxStart : idxEnd+1]
+		var subMap map[string]any
+		if err := json.Unmarshal([]byte(jsonPart), &subMap); err == nil {
+			name := ""
+			if n, ok := subMap["name"].(string); ok && n != "" {
+				name = n
+			} else if fn, ok := subMap["function"].(map[string]any); ok {
+				if n, ok := fn["name"].(string); ok {
+					name = n
+				}
+			}
+			var params any
+			if p, ok := subMap["params"]; ok {
+				params = p
+			} else if a, ok := subMap["arguments"]; ok {
+				params = a
+			} else if in, ok := subMap["input"]; ok {
+				params = in
+			}
+			if name != "" {
+				return buildToolCall(name, params, toolMap), true
+			}
+		}
+	}
+
+	// 3. XML with <param name="...">
+	matchesParam := xmlParamRegex.FindAllStringSubmatch(trimmed, -1)
+	if len(matchesParam) > 0 {
+		name := ""
+		params := make(map[string]any)
+		lines := strings.Split(trimmed, "\n")
+		firstLine := strings.TrimSpace(lines[0])
+		if !strings.HasPrefix(firstLine, "<param") {
+			name = strings.Fields(firstLine)[0]
+		}
+		for _, m := range matchesParam {
+			params[m[1]] = strings.TrimSpace(m[2])
+		}
+		if name != "" || len(params) > 0 {
+			if name == "" && toolMap != nil {
+				for _, origName := range toolMap {
+					name = origName
+					break
+				}
+			}
+			return buildToolCall(name, params, toolMap), true
+		}
+	}
+
+	// 4. XML with <arg_key> / <arg_value>
+	matchesArg := xmlArgKeyRegex.FindAllStringSubmatch(trimmed, -1)
+	if len(matchesArg) > 0 {
+		fields := strings.Fields(trimmed)
+		name := ""
+		if len(fields) > 0 && !strings.HasPrefix(fields[0], "<") {
+			name = fields[0]
+		}
+		params := make(map[string]any)
+		for _, m := range matchesArg {
+			params[m[1]] = strings.TrimSpace(m[2])
+		}
+		if name != "" || len(params) > 0 {
+			return buildToolCall(name, params, toolMap), true
+		}
+	}
+
+	// 5. XML attribute style: ToolName key="value"
+	fields := strings.Fields(trimmed)
+	if len(fields) > 0 && !strings.HasPrefix(fields[0], "<") {
+		name := fields[0]
+		attrMatches := xmlAttrRegex.FindAllStringSubmatch(trimmed, -1)
+		if len(attrMatches) > 0 {
+			params := make(map[string]any)
+			for _, m := range attrMatches {
+				params[m[1]] = m[2]
+			}
+			return buildToolCall(name, params, toolMap), true
+		}
+	}
+
+	return TraeToolCall{}, false
+}
+
+// ExtractToolCallsFromText extracts all <toolcall> tags from full text.
+func ExtractToolCallsFromText(text string, toolMap map[string]string) []TraeToolCall {
+	var calls []TraeToolCall
+	matches := reToolCall.FindAllStringSubmatch(text, -1)
+	idx := 0
+	for _, m := range matches {
+		rawInner := m[2]
+		if tc, ok := ParseToolcallContent(rawInner, toolMap); ok {
+			tc.Index = idx
+			idx++
+			calls = append(calls, tc)
+		}
+	}
+	if len(calls) == 0 {
+		// Try loose unclosed match
+		looseMatches := reLooseToolCall.FindAllStringSubmatch(text, -1)
+		for _, m := range looseMatches {
+			rawInner := strings.TrimSpace(m[2])
+			if rawInner == "" {
+				continue
+			}
+			if tc, ok := ParseToolcallContent(rawInner, toolMap); ok {
+				tc.Index = idx
+				idx++
+				calls = append(calls, tc)
+			}
+		}
+	}
+	return calls
+}
+
+// StripToolCallsFromText removes <toolcall>...</toolcall> tags from generated content.
+func StripToolCallsFromText(text string) string {
+	re := regexp.MustCompile(`(?s)<(?:tool_call|toolcall)(?:\s[^>]*)?>.*?(</(?:tool_call|toolcall)>|$)`)
+	return strings.TrimSpace(re.ReplaceAllString(text, ""))
+}
+
+// FormatOpenAIStreamToolCallChunk constructs an SSE chunk with delta.tool_calls in OpenAI format.
+func FormatOpenAIStreamToolCallChunk(id, model string, calls []TraeToolCall) []byte {
+	if len(calls) == 0 {
+		return nil
+	}
+
+	var toolCallsList []map[string]any
+	for _, call := range calls {
+		toolCallsList = append(toolCallsList, map[string]any{
+			"index": call.Index,
+			"id":    call.ID,
+			"type":  "function",
+			"function": map[string]any{
+				"name":      call.Name,
+				"arguments": call.Args,
+			},
+		})
+	}
+
+	choice := map[string]any{
+		"index": 0,
+		"delta": map[string]any{
+			"tool_calls": toolCallsList,
+		},
+		"finish_reason": nil,
+	}
+
+	chunkObj := map[string]any{
+		"id":      id,
+		"object":  "chat.completion.chunk",
+		"created": time.Now().Unix(),
+		"model":   model,
+		"choices": []any{choice},
+	}
+
+	b, _ := json.Marshal(chunkObj)
+	return b
+}
+
+func isToolCallPrefix(s string) bool {
+	return strings.HasPrefix("<toolcall>", s) ||
+		strings.HasPrefix("<tool_call>", s) ||
+		strings.HasPrefix("<toolcall ", s) ||
+		strings.HasPrefix("<tool_call ", s)
+}
+
+func isToolCallTag(s string) bool {
+	return strings.HasPrefix(s, "<toolcall>") ||
+		strings.HasPrefix(s, "<tool_call>") ||
+		strings.HasPrefix(s, "<toolcall ") ||
+		strings.HasPrefix(s, "<tool_call ")
+}
+
+// ToolCallStreamFilter buffers streaming chunks, hides <toolcall> tags from text output,
+// and extracts TraeToolCall events to send to clients.
+type ToolCallStreamFilter struct {
+	toolMap         map[string]string
+	inToolCall      bool
+	toolCallBuffer  strings.Builder
+	accumulatedText strings.Builder
+	emittedCalls    []TraeToolCall
+	callCount       int
+}
+
+// NewToolCallStreamFilter creates a filter for stripping and parsing tool calls in stream.
+func NewToolCallStreamFilter(toolMap map[string]string) *ToolCallStreamFilter {
+	return &ToolCallStreamFilter{
+		toolMap: toolMap,
+	}
+}
+
+// Feed receives a text chunk from upstream and returns filtered text and any detected tool calls.
+func (f *ToolCallStreamFilter) Feed(chunk string) (string, []TraeToolCall) {
+	if chunk == "" {
+		return "", nil
+	}
+	f.accumulatedText.WriteString(chunk)
+
+	var textOut strings.Builder
+	var newCalls []TraeToolCall
+
+	for i := 0; i < len(chunk); i++ {
+		ch := chunk[i]
+
+		if f.inToolCall {
+			f.toolCallBuffer.WriteByte(ch)
+			bufStr := f.toolCallBuffer.String()
+
+			closingTag := ""
+			if strings.HasSuffix(bufStr, "</toolcall>") {
+				closingTag = "</toolcall>"
+			} else if strings.HasSuffix(bufStr, "</tool_call>") {
+				closingTag = "</tool_call>"
+			}
+
+			if closingTag != "" {
+				inner := bufStr[:len(bufStr)-len(closingTag)]
+				tc, ok := ParseToolcallContent(inner, f.toolMap)
+				if ok {
+					tc.Index = f.callCount
+					f.callCount++
+					f.emittedCalls = append(f.emittedCalls, tc)
+					newCalls = append(newCalls, tc)
+				}
+				f.inToolCall = false
+				f.toolCallBuffer.Reset()
+			}
+		} else {
+			f.toolCallBuffer.WriteByte(ch)
+			bufStr := f.toolCallBuffer.String()
+
+			if ch == '>' {
+				// Check if this formed a <toolcall> or <tool_call> start
+				ltIdx := strings.LastIndex(bufStr, "<")
+				if ltIdx >= 0 {
+					tagCandidate := bufStr[ltIdx:]
+					if isToolCallTag(tagCandidate) {
+						f.inToolCall = true
+						if ltIdx > 0 {
+							textOut.WriteString(bufStr[:ltIdx])
+						}
+						f.toolCallBuffer.Reset()
+						continue
+					}
+				}
+			}
+
+			// If buffer doesn't look like an in-progress <toolcall tag, flush text
+			ltIdx := strings.LastIndex(bufStr, "<")
+			if ltIdx == -1 {
+				textOut.WriteString(bufStr)
+				f.toolCallBuffer.Reset()
+			} else if ltIdx > 0 {
+				candidate := bufStr[ltIdx:]
+				if !isToolCallPrefix(candidate) {
+					textOut.WriteString(bufStr)
+					f.toolCallBuffer.Reset()
+				} else {
+					textOut.WriteString(bufStr[:ltIdx])
+					f.toolCallBuffer.Reset()
+					f.toolCallBuffer.WriteString(candidate)
+				}
+			} else if !isToolCallPrefix(bufStr) && f.toolCallBuffer.Len() > 20 {
+				textOut.WriteString(bufStr)
+				f.toolCallBuffer.Reset()
+			}
+		}
+	}
+
+	return textOut.String(), newCalls
+}
+
+// Flush flushes remaining buffer content and recovers any incomplete tool calls.
+func (f *ToolCallStreamFilter) Flush() (string, []TraeToolCall) {
+	var textOut strings.Builder
+	var finalCalls []TraeToolCall
+
+	bufStr := f.toolCallBuffer.String()
+	if bufStr != "" {
+		if f.inToolCall {
+			tc, ok := ParseToolcallContent(bufStr, f.toolMap)
+			if ok {
+				tc.Index = f.callCount
+				f.callCount++
+				f.emittedCalls = append(f.emittedCalls, tc)
+				finalCalls = append(finalCalls, tc)
+			}
+		} else {
+			textOut.WriteString(bufStr)
+		}
+		f.toolCallBuffer.Reset()
+		f.inToolCall = false
+	}
+
+	// Secondary check: ensure no toolcall was missed in accumulated text
+	extracted := ExtractToolCallsFromText(f.accumulatedText.String(), f.toolMap)
+	for _, tc := range extracted {
+		alreadyEmitted := false
+		for _, em := range f.emittedCalls {
+			if em.Name == tc.Name && em.Args == tc.Args {
+				alreadyEmitted = true
+				break
+			}
+		}
+		if !alreadyEmitted {
+			tc.Index = f.callCount
+			f.callCount++
+			f.emittedCalls = append(f.emittedCalls, tc)
+			finalCalls = append(finalCalls, tc)
+		}
+	}
+
+	return textOut.String(), finalCalls
+}
+
+// HasEmittedCalls returns whether any tool calls were emitted by this filter.
+func (f *ToolCallStreamFilter) HasEmittedCalls() bool {
+	return len(f.emittedCalls) > 0
 }

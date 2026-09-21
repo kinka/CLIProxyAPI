@@ -12,6 +12,8 @@ import (
 	traeauth "github.com/router-for-me/CLIProxyAPI/v7/internal/auth/trae"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/config"
 	"github.com/router-for-me/CLIProxyAPI/v7/internal/runtime/executor/helps"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/claude/openai/chat-completions"
+	_ "github.com/router-for-me/CLIProxyAPI/v7/internal/translator/openai/claude"
 	cliproxyauth "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/auth"
 	cliproxyexecutor "github.com/router-for-me/CLIProxyAPI/v7/sdk/cliproxy/executor"
 	sdktranslator "github.com/router-for-me/CLIProxyAPI/v7/sdk/translator"
@@ -434,5 +436,128 @@ func TestTraeExecutorFallbackOn4001(t *testing.T) {
 	}
 	if rawChatHit == 0 || chatV3Hit == 0 {
 		t.Errorf("expected both raw_chat and chat_v3 to be hit in non-stream fallback, got raw=%d, chat_v3=%d", rawChatHit, chatV3Hit)
+	}
+}
+
+func TestTraeExecutorToolCallsStreamingAndNonStreaming(t *testing.T) {
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+
+		w.WriteHeader(http.StatusOK)
+		lines := []string{
+			"event: output\n",
+			`data: {"content":"I will run the command.\n<toolcall>{\"name\": \"bash\", \"params\": {\"command\": \"pwd\"}}</toolcall>\nPlease wait."}` + "\n\n",
+			"event: done\n",
+			`data: {"finish_reason":"stop"}` + "\n\n",
+			"data: [DONE]\n\n",
+		}
+		for _, l := range lines {
+			_, _ = w.Write([]byte(l))
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	cfg := &config.Config{}
+	exec := NewTraeExecutor(cfg)
+	auth := &cliproxyauth.Auth{
+		ID:       "test-trae-tool",
+		Provider: "trae",
+		Storage: &traeauth.TraeTokenStorage{
+			AccessToken: "test-token",
+			Host:        server.URL,
+		},
+	}
+
+	ctx := context.Background()
+	payload := []byte(`{
+		"model": "glm-5.3-flash",
+		"messages": [{"role": "user", "content": "where am I?"}],
+		"tools": [
+			{
+				"type": "function",
+				"function": {
+					"name": "Bash",
+					"description": "Run shell command",
+					"parameters": {
+						"type": "object",
+						"properties": {"command": {"type": "string"}}
+					}
+				}
+			}
+		]
+	}`)
+
+	// 1. Non-streaming test
+	req := cliproxyexecutor.Request{
+		Model:   "glm-5.3-flash",
+		Payload: payload,
+	}
+	opts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatOpenAI,
+	}
+	resp, err := exec.Execute(ctx, auth, req, opts)
+	if err != nil {
+		t.Fatalf("execute failed: %v", err)
+	}
+	respParsed := gjson.ParseBytes(resp.Payload)
+	if respParsed.Get("choices.0.finish_reason").String() != "tool_calls" {
+		t.Errorf("expected finish_reason tool_calls, got %q", respParsed.Get("choices.0.finish_reason").String())
+	}
+	tcName := respParsed.Get("choices.0.message.tool_calls.0.function.name").String()
+	if tcName != "Bash" {
+		t.Errorf("expected tool_call name Bash, got %q", tcName)
+	}
+
+	// 2. Streaming test with Claude source format (simulating Claude Code)
+	claudePayload := []byte(`{
+		"model": "glm-5.3-flash",
+		"stream": true,
+		"messages": [{"role": "user", "content": "where am I?"}],
+		"tools": [
+			{
+				"name": "Bash",
+				"description": "Run shell command",
+				"input_schema": {
+					"type": "object",
+					"properties": {"command": {"type": "string"}}
+				}
+			}
+		]
+	}`)
+	claudeReq := cliproxyexecutor.Request{
+		Model:   "glm-5.3-flash",
+		Payload: claudePayload,
+	}
+	claudeOpts := cliproxyexecutor.Options{
+		SourceFormat: sdktranslator.FormatClaude,
+	}
+	streamRes, err := exec.ExecuteStream(ctx, auth, claudeReq, claudeOpts)
+	if err != nil {
+		t.Fatalf("stream execute failed: %v", err)
+	}
+
+	var fullSSE strings.Builder
+	for c := range streamRes.Chunks {
+		if c.Err != nil {
+			t.Fatalf("unexpected stream err: %v", c.Err)
+		}
+		fullSSE.Write(c.Payload)
+	}
+	sseStr := fullSSE.String()
+
+	// Verify Claude SSE contains tool_use and stop_reason: tool_use
+	if !strings.Contains(sseStr, `"type":"tool_use"`) {
+		t.Errorf("expected sse stream to contain tool_use block, got:\n%s", sseStr)
+	}
+	if !strings.Contains(sseStr, `"name":"Bash"`) {
+		t.Errorf("expected sse stream to contain name Bash, got:\n%s", sseStr)
+	}
+	if !strings.Contains(sseStr, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected sse stream to contain stop_reason tool_use, got:\n%s", sseStr)
 	}
 }

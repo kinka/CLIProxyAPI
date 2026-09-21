@@ -481,7 +481,13 @@ func (e *TraeExecutor) Execute(ctx context.Context, auth *cliproxyauth.Auth, req
 	}
 
 	compID := fmt.Sprintf("chatcmpl-%d", time.Now().UnixNano())
-	openAIRespJSON := helps.FormatOpenAINonStreamResponse(compID, req.Model, fullContent.String(), fullReasoning.String(), lastUsage)
+	toolMap := helps.ExtractToolMapFromPayload(openAIPayload, originalPayload)
+	toolCalls := helps.ExtractToolCallsFromText(fullContent.String(), toolMap)
+	cleanContent := fullContent.String()
+	if len(toolCalls) > 0 {
+		cleanContent = helps.StripToolCallsFromText(cleanContent)
+	}
+	openAIRespJSON := helps.FormatOpenAINonStreamResponseWithTools(compID, req.Model, cleanContent, fullReasoning.String(), toolCalls, lastUsage)
 
 	if lastUsage != nil {
 		reporter.Publish(ctx, helps.ParseOpenAIUsage(openAIRespJSON))
@@ -631,6 +637,9 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		var streamUsage helps.StreamUsageBuffer
 		defer streamUsage.Publish(ctx, reporter)
 
+		toolMap := helps.ExtractToolMapFromPayload(openAIPayload, originalPayload)
+		toolFilter := helps.NewToolCallStreamFilter(toolMap)
+
 		for scanner.Scan() {
 			line := scanner.Text()
 			helps.AppendAPIResponseChunk(ctx, e.cfg, []byte(line+"\n"))
@@ -641,16 +650,53 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 			}
 
 			if parsed.Type == "text" {
-				chunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, parsed.Content, parsed.Reasoning, "")
-				lineChunk := append([]byte("data: "), chunkJSON...)
-				lineChunk = append(lineChunk, []byte("\n\n")...)
+				if parsed.Reasoning != "" {
+					chunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, "", parsed.Reasoning, "")
+					lineChunk := append([]byte("data: "), chunkJSON...)
+					lineChunk = append(lineChunk, []byte("\n\n")...)
 
-				chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
-				for i := range chunks {
-					select {
-					case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
-					case <-ctx.Done():
-						return
+					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+					for i := range chunks {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+
+				if parsed.Content != "" {
+					cleanText, newCalls := toolFilter.Feed(parsed.Content)
+					if cleanText != "" {
+						chunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, cleanText, "", "")
+						lineChunk := append([]byte("data: "), chunkJSON...)
+						lineChunk = append(lineChunk, []byte("\n\n")...)
+
+						chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+						for i := range chunks {
+							select {
+							case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}
+
+					if len(newCalls) > 0 {
+						tcChunkJSON := helps.FormatOpenAIStreamToolCallChunk(compID, req.Model, newCalls)
+						if len(tcChunkJSON) > 0 {
+							lineChunk := append([]byte("data: "), tcChunkJSON...)
+							lineChunk = append(lineChunk, []byte("\n\n")...)
+
+							chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+							for i := range chunks {
+								select {
+								case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+								case <-ctx.Done():
+									return
+								}
+							}
+						}
 					}
 				}
 			} else if parsed.Type == "token_usage" && parsed.TokenUsage != nil {
@@ -678,7 +724,47 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				}
 				return
 			} else if parsed.Type == "done" {
-				doneChunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, "", "", parsed.FinishReason)
+				flushText, finalCalls := toolFilter.Flush()
+				if flushText != "" {
+					chunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, flushText, "", "")
+					lineChunk := append([]byte("data: "), chunkJSON...)
+					lineChunk = append(lineChunk, []byte("\n\n")...)
+
+					chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+					for i := range chunks {
+						select {
+						case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+						case <-ctx.Done():
+							return
+						}
+					}
+				}
+
+				if len(finalCalls) > 0 {
+					tcChunkJSON := helps.FormatOpenAIStreamToolCallChunk(compID, req.Model, finalCalls)
+					if len(tcChunkJSON) > 0 {
+						lineChunk := append([]byte("data: "), tcChunkJSON...)
+						lineChunk = append(lineChunk, []byte("\n\n")...)
+
+						chunks := helps.TranslateStreamWithClaudeInputTokens(ctx, to, responseFormat, req.Model, originalPayload, openAIPayload, bytes.Clone(lineChunk), &param, claudeInputTokens)
+						for i := range chunks {
+							select {
+							case out <- cliproxyexecutor.StreamChunk{Payload: chunks[i]}:
+							case <-ctx.Done():
+								return
+							}
+						}
+					}
+				}
+
+				finishReason := parsed.FinishReason
+				if toolFilter.HasEmittedCalls() {
+					finishReason = "tool_calls"
+				} else if finishReason == "" {
+					finishReason = "stop"
+				}
+
+				doneChunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, "", "", finishReason)
 				lineChunk := append([]byte("data: "), doneChunkJSON...)
 				lineChunk = append(lineChunk, []byte("\n\n")...)
 

@@ -31,7 +31,19 @@ func (h *Handler) traeCallbackURL() (string, error) {
 
 // RequestTraeToken starts the Trae OAuth 2.0 PKCE authorization flow for WebUI and management clients.
 func (h *Handler) RequestTraeToken(c *gin.Context) {
+	h.requestTraeTokenWithEdition(c, "")
+}
+
+// RequestTraeEnterpriseToken starts the Trae Enterprise OAuth 2.0 PKCE authorization flow.
+func (h *Handler) RequestTraeEnterpriseToken(c *gin.Context) {
+	h.requestTraeTokenWithEdition(c, "enterprise")
+}
+
+func (h *Handler) requestTraeTokenWithEdition(c *gin.Context, forcedEdition string) {
 	edition := strings.ToLower(strings.TrimSpace(c.Query("edition")))
+	if forcedEdition != "" {
+		edition = forcedEdition
+	}
 	if edition == "" {
 		edition = "cn"
 	}
