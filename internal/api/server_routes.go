@@ -206,11 +206,27 @@ func (s *Server) setupRoutes() {
 
 	traeCallbackHandler := func(c *gin.Context) {
 		c.Header("Cache-Control", "no-store")
-		code := strings.TrimSpace(c.Query("code"))
-		state := strings.TrimSpace(c.Query("state"))
-		errStr := strings.TrimSpace(c.Query("error"))
-		if errStr == "" {
-			errStr = strings.TrimSpace(c.Query("error_description"))
+		code := strings.TrimSpace(firstNonEmpty(c.Query("code"), c.Query("AuthCode"), c.Query("auth_code")))
+		if code == "" {
+			if infoStr := c.Query("authCodeInfo"); infoStr != "" {
+				var infoMap map[string]any
+				if err := json.Unmarshal([]byte(infoStr), &infoMap); err == nil {
+					for _, k := range []string{"AuthCode", "auth_code", "code", "Code"} {
+						if v, ok := infoMap[k].(string); ok && v != "" {
+							code = v
+							break
+						}
+					}
+				} else {
+					code = infoStr
+				}
+			}
+		}
+		state := strings.TrimSpace(firstNonEmpty(c.Query("state"), c.Query("loginTraceID"), c.Query("login_trace_id")))
+		errStr := strings.TrimSpace(firstNonEmpty(c.Query("error"), c.Query("error_msg"), c.Query("error_description")))
+		if state == "" {
+			c.JSON(http.StatusBadRequest, gin.H{"error": "state is required"})
+			return
 		}
 		if code == "" && errStr == "" {
 			c.JSON(http.StatusBadRequest, gin.H{"error": "code or error is required"})
@@ -227,6 +243,7 @@ func (s *Server) setupRoutes() {
 	s.engine.GET("/callback", devinCallbackHandler)
 	s.engine.GET("/devin/callback", devinCallbackHandler)
 	s.engine.GET("/trae/callback", traeCallbackHandler)
+	s.engine.GET("/authorize", traeCallbackHandler)
 
 	// Management routes are registered lazily by registerManagementRoutes when a secret is configured.
 }
@@ -1174,4 +1191,13 @@ func homeModelInt64Value(model map[string]any, keys ...string) int64 {
 		}
 	}
 	return 0
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

@@ -57,7 +57,7 @@ func TestTraeRemoteOAuthFlow(t *testing.T) {
 	if u.Query().Get("state") != startResp.State {
 		t.Errorf("expected state %s, got %s", startResp.State, u.Query().Get("state"))
 	}
-	if u.Query().Get("auth_callback_url") != "http://127.0.0.1:8317/trae/callback" {
+	if u.Query().Get("auth_callback_url") != "http://127.0.0.1:8317/authorize" {
 		t.Errorf("unexpected callback url: %s", u.Query().Get("auth_callback_url"))
 	}
 

@@ -125,7 +125,7 @@ func (a *TraeAuthenticator) Login(ctx context.Context, cfg *config.Config, opts 
 
 	machineID := uuid.New().String()
 	deviceID := traeauth.HashDeviceID(machineID)
-	callbackURL := fmt.Sprintf("http://127.0.0.1:%d/callback", callbackPort)
+	callbackURL := fmt.Sprintf("http://127.0.0.1:%d/authorize", callbackPort)
 
 	authURL, err := traeauth.BuildAuthorizationURL(traeauth.TraeAuthURLOptions{
 		Edition:      edition,
@@ -133,6 +133,7 @@ func (a *TraeAuthenticator) Login(ctx context.Context, cfg *config.Config, opts 
 		APIHost:      apiHost,
 		CallbackURL:  callbackURL,
 		State:        state,
+		LoginTraceID: state,
 		PKCE:         pkceCodes,
 		MachineID:    machineID,
 		DeviceID:     deviceID,

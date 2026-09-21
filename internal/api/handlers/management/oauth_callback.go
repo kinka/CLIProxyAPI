@@ -1,6 +1,7 @@
 package management
 
 import (
+	"encoding/json"
 	"errors"
 	"net/http"
 	"net/url"
@@ -60,16 +61,28 @@ func (h *Handler) handleOAuthCallback(c *gin.Context, req oauthCallbackRequest) 
 		}
 		q := u.Query()
 		if state == "" {
-			state = strings.TrimSpace(q.Get("state"))
+			state = strings.TrimSpace(firstNonEmpty(q.Get("state"), q.Get("loginTraceID"), q.Get("login_trace_id")))
 		}
 		if code == "" {
-			code = strings.TrimSpace(q.Get("code"))
+			code = strings.TrimSpace(firstNonEmpty(q.Get("code"), q.Get("AuthCode"), q.Get("auth_code")))
+		}
+		if code == "" {
+			if infoStr := q.Get("authCodeInfo"); infoStr != "" {
+				var infoMap map[string]any
+				if err := json.Unmarshal([]byte(infoStr), &infoMap); err == nil {
+					for _, k := range []string{"AuthCode", "auth_code", "code", "Code"} {
+						if v, ok := infoMap[k].(string); ok && v != "" {
+							code = v
+							break
+						}
+					}
+				} else {
+					code = infoStr
+				}
+			}
 		}
 		if errMsg == "" {
-			errMsg = strings.TrimSpace(q.Get("error"))
-			if errMsg == "" {
-				errMsg = strings.TrimSpace(q.Get("error_description"))
-			}
+			errMsg = strings.TrimSpace(firstNonEmpty(q.Get("error"), q.Get("error_msg"), q.Get("error_description")))
 		}
 	}
 

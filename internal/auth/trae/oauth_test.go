@@ -40,7 +40,7 @@ func TestBuildAuthorizationURL(t *testing.T) {
 	// 1. CN Edition
 	cnURL, err := BuildAuthorizationURL(TraeAuthURLOptions{
 		Edition:     "cn",
-		CallbackURL: "http://127.0.0.1:54546/callback",
+		CallbackURL: "http://127.0.0.1:54546/authorize",
 		State:       "test-cn-state",
 		PKCE:        pkce,
 		MachineID:   "m-12345",
@@ -65,14 +65,14 @@ func TestBuildAuthorizationURL(t *testing.T) {
 	if q.Get("state") != "test-cn-state" {
 		t.Errorf("expected state test-cn-state, got %s", q.Get("state"))
 	}
-	if q.Get("auth_callback_url") != "http://127.0.0.1:54546/callback" {
+	if q.Get("auth_callback_url") != "http://127.0.0.1:54546/authorize" {
 		t.Errorf("unexpected callback url: %s", q.Get("auth_callback_url"))
 	}
 
 	// 2. SG Edition
 	sgURL, err := BuildAuthorizationURL(TraeAuthURLOptions{
 		Edition:     "sg",
-		CallbackURL: "http://127.0.0.1:54546/callback",
+		CallbackURL: "http://127.0.0.1:54546/authorize",
 		State:       "test-sg-state",
 		PKCE:        pkce,
 	})

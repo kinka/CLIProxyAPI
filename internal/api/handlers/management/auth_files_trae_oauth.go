@@ -26,7 +26,7 @@ func (h *Handler) traeCallbackURL() (string, error) {
 	if h == nil || h.cfg == nil || h.cfg.Port <= 0 {
 		return "", fmt.Errorf("server port is not configured")
 	}
-	return fmt.Sprintf("http://127.0.0.1:%d/trae/callback", h.cfg.Port), nil
+	return fmt.Sprintf("http://127.0.0.1:%d/authorize", h.cfg.Port), nil
 }
 
 // RequestTraeToken starts the Trae OAuth 2.0 PKCE authorization flow for WebUI and management clients.
@@ -51,7 +51,7 @@ func (h *Handler) RequestTraeToken(c *gin.Context) {
 			return
 		}
 	} else {
-		callbackURL = fmt.Sprintf("http://127.0.0.1:%d/callback", traeCallbackPort)
+		callbackURL = fmt.Sprintf("http://127.0.0.1:%d/authorize", traeCallbackPort)
 	}
 
 	pkceCodes, errPKCE := trae.GeneratePKCECodes()
@@ -80,6 +80,7 @@ func (h *Handler) RequestTraeToken(c *gin.Context) {
 		APIHost:      apiHost,
 		CallbackURL:  callbackURL,
 		State:        state,
+		LoginTraceID: state,
 		PKCE:         pkceCodes,
 		MachineID:    machineID,
 		DeviceID:     deviceID,
@@ -94,7 +95,7 @@ func (h *Handler) RequestTraeToken(c *gin.Context) {
 
 	var forwarder *callbackForwarder
 	if isWebUI {
-		targetURL, errTarget := h.managementCallbackURL("/trae/callback")
+		targetURL, errTarget := h.managementCallbackURL("/authorize")
 		if errTarget == nil {
 			forwarder, _ = startCallbackForwarder(traeCallbackPort, "trae", targetURL)
 		}

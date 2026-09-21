@@ -71,8 +71,9 @@ type TraeAuthURLOptions struct {
 	Edition      string     // "cn", "sg", "enterprise"
 	ConsoleHost  string     // e.g. "https://console.enterprise.trae.cn" or custom enterprise console domain
 	APIHost      string     // e.g. "https://trae-api-cn.mchost.guru"
-	CallbackURL  string     // e.g. "http://127.0.0.1:54546/callback"
+	CallbackURL  string     // e.g. "http://127.0.0.1:54546/authorize"
 	State        string     // OAuth state
+	LoginTraceID string     // login trace ID (defaults to state or uuid)
 	PKCE         *PKCECodes // PKCE verifier and challenge
 	MachineID    string     // machine ID (UUID)
 	DeviceID     string     // device ID (hashed machine ID)
@@ -128,6 +129,23 @@ func BuildAuthorizationURL(opts TraeAuthURLOptions) (string, error) {
 		clientID = DefaultOAuthClientID
 	}
 
+	loginTraceID := strings.TrimSpace(opts.LoginTraceID)
+	if loginTraceID == "" {
+		if strings.TrimSpace(opts.State) != "" {
+			loginTraceID = strings.TrimSpace(opts.State)
+		} else {
+			loginTraceID = uuid.New().String()
+		}
+	}
+
+	callbackURL := strings.TrimSpace(opts.CallbackURL)
+	if parsedCB, errCB := url.Parse(callbackURL); errCB == nil && parsedCB.Host != "" {
+		parsedCB.RawQuery = ""
+		parsedCB.Fragment = ""
+		parsedCB.Path = "/authorize"
+		callbackURL = parsedCB.String()
+	}
+
 	params := url.Values{}
 	params.Set("login_version", "1")
 	params.Set("auth_from", "trae")
@@ -136,8 +154,8 @@ func BuildAuthorizationURL(opts TraeAuthURLOptions) (string, error) {
 	params.Set("auth_type", "local")
 	params.Set("client_id", clientID)
 	params.Set("redirect", "0")
-	params.Set("login_trace_id", uuid.New().String())
-	params.Set("auth_callback_url", opts.CallbackURL)
+	params.Set("login_trace_id", loginTraceID)
+	params.Set("auth_callback_url", callbackURL)
 	params.Set("machine_id", machineID)
 	params.Set("device_id", deviceID)
 	params.Set("x_device_id", deviceID)
@@ -516,12 +534,24 @@ func (s *TraeOAuthServer) WaitForCallback(timeout time.Duration) (*TraeOAuthResu
 
 func (s *TraeOAuthServer) handleCallback(w http.ResponseWriter, r *http.Request) {
 	q := r.URL.Query()
-	code := strings.TrimSpace(q.Get("code"))
-	state := strings.TrimSpace(q.Get("state"))
-	errStr := strings.TrimSpace(q.Get("error"))
-	if errStr == "" {
-		errStr = strings.TrimSpace(q.Get("error_description"))
+	code := strings.TrimSpace(firstNonEmpty(q.Get("code"), q.Get("AuthCode"), q.Get("auth_code")))
+	if code == "" {
+		if infoStr := q.Get("authCodeInfo"); infoStr != "" {
+			var infoMap map[string]any
+			if err := json.Unmarshal([]byte(infoStr), &infoMap); err == nil {
+				for _, k := range []string{"AuthCode", "auth_code", "code", "Code"} {
+					if v, ok := infoMap[k].(string); ok && v != "" {
+						code = v
+						break
+					}
+				}
+			} else {
+				code = infoStr
+			}
+		}
 	}
+	state := strings.TrimSpace(firstNonEmpty(q.Get("state"), q.Get("loginTraceID"), q.Get("login_trace_id")))
+	errStr := strings.TrimSpace(firstNonEmpty(q.Get("error"), q.Get("error_msg"), q.Get("error_description")))
 
 	if errStr != "" {
 		s.resultChan <- &TraeOAuthResult{Error: errStr, State: state}
@@ -562,4 +592,13 @@ func (s *TraeOAuthServer) handleCallback(w http.ResponseWriter, r *http.Request)
     </div>
 </body>
 </html>`))
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }

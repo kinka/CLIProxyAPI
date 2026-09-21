@@ -3,6 +3,7 @@ package misc
 import (
 	"crypto/rand"
 	"encoding/hex"
+	"encoding/json"
 	"fmt"
 	"net/url"
 	"strings"
@@ -75,8 +76,32 @@ func ParseOAuthCallback(input string) (*OAuthCallback, error) {
 
 	query := parsedURL.Query()
 	code := strings.TrimSpace(query.Get("code"))
+	if code == "" {
+		code = strings.TrimSpace(firstNonEmpty(query.Get("AuthCode"), query.Get("auth_code")))
+	}
+	if code == "" {
+		if infoStr := query.Get("authCodeInfo"); infoStr != "" {
+			var infoMap map[string]any
+			if err := json.Unmarshal([]byte(infoStr), &infoMap); err == nil {
+				for _, k := range []string{"AuthCode", "auth_code", "code", "Code"} {
+					if v, ok := infoMap[k].(string); ok && v != "" {
+						code = v
+						break
+					}
+				}
+			} else {
+				code = infoStr
+			}
+		}
+	}
 	state := strings.TrimSpace(query.Get("state"))
+	if state == "" {
+		state = strings.TrimSpace(firstNonEmpty(query.Get("loginTraceID"), query.Get("login_trace_id")))
+	}
 	errCode := strings.TrimSpace(query.Get("error"))
+	if errCode == "" {
+		errCode = strings.TrimSpace(query.Get("error_msg"))
+	}
 	errDesc := strings.TrimSpace(query.Get("error_description"))
 
 	if parsedURL.Fragment != "" {
@@ -117,4 +142,13 @@ func ParseOAuthCallback(input string) (*OAuthCallback, error) {
 		Error:            errCode,
 		ErrorDescription: errDesc,
 	}, nil
+}
+
+func firstNonEmpty(vals ...string) string {
+	for _, v := range vals {
+		if strings.TrimSpace(v) != "" {
+			return v
+		}
+	}
+	return ""
 }
