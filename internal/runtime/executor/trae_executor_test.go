@@ -56,26 +56,34 @@ func TestTraeModelResolution(t *testing.T) {
 		{"auto", "inline_chat", ""},
 		{"trae-auto", "inline_chat", ""},
 		{"inline_chat", "inline_chat", ""},
-		{"glm-5.2", "chat_v3", "glm-5.2"},
-		{"glm-5.1", "chat_v3", "glm-5.1"},
-		{"glm-5", "chat_v3", "glm-5"},
-		{"doubao-seed-code", "chat_v3", "Doubao_1_6"},
-		{"doubao-1-6", "chat_v3", "Doubao_1_6"},
-		{"DeepSeek-V4-Pro", "chat_v3", "deepseek-V4-Pro"},
-		{"deepseek-r1", "chat_v3", "custom_model_deepseek_reasoner"},
-		{"qwen-3.7-plus", "chat_v3", "qwen-3.7-plus"},
-		{"kimi-k2.6", "chat_v3", "kimi-k2.6"},
-		{"kimi-k3", "solo_agent", "kimi-k3"},
-		{"kimi-k2.8-preview", "solo_agent", "kimi-k2.8-preview"},
-		{"kimi-k2.8", "solo_agent", "kimi-k2.8-preview"},
-		{"deepseek-v4.1-flash", "solo_agent", "DeepSeek-V4.1-Flash"},
 		{"glm-5.3", "solo_agent", "glm-5.3"},
 		{"glm-5.3-flash", "solo_agent", "glm-5.3-flash"},
+		{"gf", "solo_agent", "glm-5.3-flash"},
+		{"glm-5.2", "solo_agent", "glm-5.2"},
+		{"glm-5.1", "chat_v3", "glm-5.1"},
+		{"glm-5", "chat_v3", "glm-5"},
+		{"doubao-seed-code", "solo_agent", "Doubao_1_6"},
+		{"doubao-1-6", "solo_agent", "Doubao_1_6"},
+		{"doubao", "solo_agent", "Doubao_1_6"},
+		{"DeepSeek-V4-Pro", "solo_agent", "DeepSeek-V4-Pro-Official"},
+		{"deepseek-r1", "chat_v3", "custom_model_deepseek_reasoner"},
+		{"qwen-3.7-plus", "solo_agent", "qwen-3.7-plus"},
+		{"qwen", "solo_agent", "qwen-3.7-plus"},
+		{"kimi-k2.6", "solo_agent", "kimi-k2.6"},
+		{"k2.6", "solo_agent", "kimi-k2.6"},
+		{"kimi-k3", "solo_agent", "kimi-k3"},
+		{"k3", "solo_agent", "kimi-k3"},
+		{"kimi-k2.8-preview", "solo_agent", "kimi-k2.8-preview"},
+		{"kimi-k2.8", "solo_agent", "kimi-k2.8-preview"},
+		{"k2.8", "solo_agent", "kimi-k2.8-preview"},
+		{"deepseek-v4.1-flash", "solo_agent", "DeepSeek-V4.1-Flash"},
+		{"dsf", "solo_agent", "DeepSeek-V4.1-Flash"},
 		{"deepseek-v4-pro-official", "solo_agent", "DeepSeek-V4-Pro-Official"},
+		{"dsp", "solo_agent", "DeepSeek-V4-Pro-Official"},
 		{"deepseek-v4-flash-official", "solo_agent", "DeepSeek-V4-Flash-Official"},
 		{"qwen3.8-max", "solo_agent", "qwen3.8-max"},
-		{"doubao-seed-evolving", "chat_v3", "Doubao-Seed-Evolving"},
-		{"claude-3-7-sonnet", "chat_v3", "glm-5.2"},
+		{"doubao-seed-evolving", "solo_agent", "Doubao-Seed-Evolving"},
+		{"claude-3-7-sonnet", "solo_agent", "glm-5.3-flash"},
 		{"claude-3-5-haiku", "chat_v3", "glm-5.1"},
 		{"gpt-4o", "chat_v3", "custom_model_gpt-5"},
 		{"gemini-2.0-flash", "chat_v3", "custom_model_gemini"},
@@ -309,14 +317,14 @@ func TestTraeExecutorExecuteAndStream(t *testing.T) {
 }
 
 func TestTraeModelPrefersRawChat(t *testing.T) {
-	rawModels := []string{"kimi-k3", "kimi-k2.8-preview", "kimi-k2.8", "deepseek-v4.1-flash", "glm-5.3"}
+	rawModels := []string{"kimi-k3", "k3", "kimi-k2.8-preview", "k2.8", "deepseek-v4.1-flash", "dsf", "glm-5.3", "gf", "glm-5.2", "qwen-3.7-plus", "qwen", "doubao", "Doubao_1_6"}
 	for _, m := range rawModels {
 		if !helps.ModelPrefersRawChat(m) {
 			t.Errorf("expected ModelPrefersRawChat(%q) = true, got false", m)
 		}
 	}
 
-	nonRawModels := []string{"glm-5.2", "glm-5.1", "qwen-3.7-plus", "trae-auto", "claude-3-7-sonnet", "deepseek-v4-pro-official"}
+	nonRawModels := []string{"glm-5.1", "trae-auto", "kimi-k2.5", "minimax-m3"}
 	for _, m := range nonRawModels {
 		if helps.ModelPrefersRawChat(m) {
 			t.Errorf("expected ModelPrefersRawChat(%q) = false, got true", m)

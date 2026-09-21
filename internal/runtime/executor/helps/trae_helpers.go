@@ -25,12 +25,8 @@ const (
 
 // ModelPrefersRawChat returns whether the requested model should preferably be routed via llm_raw_chat.
 func ModelPrefersRawChat(model string) bool {
-	m := strings.ToLower(strings.TrimSpace(model))
-	switch m {
-	case "kimi-k3", "k3", "kimi-k2.8-preview", "kimi-k2.8", "k2.8", "deepseek-v4.1-flash", "dsf", "glm-5.3", "glm-5.3-flash", "gf", "deepseek-v4-flash-official", "qwen3.8-max", "qwen-3.8-max":
-		return true
-	}
-	return false
+	fn, _ := ResolveTraeModel(model)
+	return fn == "solo_agent"
 }
 
 // ResolveTraeModel maps user-facing model names or aliases to Trae function and config_name.
@@ -42,26 +38,41 @@ func ResolveTraeModel(model string) (functionName string, configName string) {
 
 	// Exact matches / direct configs
 	switch m {
+	// Kimi series
 	case "kimi-k3", "k3":
 		return "solo_agent", "kimi-k3"
 	case "kimi-k2.8-preview", "kimi-k2.8", "k2.8":
 		return "solo_agent", "kimi-k2.8-preview"
-	case "deepseek-v4.1-flash", "dsf":
+	case "kimi-k2.6", "k2.6":
+		return "solo_agent", "kimi-k2.6"
+	case "kimi-k2.7-code", "kimi-k2-7-code", "k2.7-code":
+		return "solo_agent", "kimi-k2.7-code"
+	case "kimi-k2.5", "kimi-k2-5":
+		return "chat_v3", "kimi-k2.5"
+	case "kimi-k2":
+		return "chat_v3", "kimi-k2"
+
+	// DeepSeek series
+	case "deepseek-v4.1-flash", "deepseek-v4-flash", "deepseek-flash", "dsf":
 		return "solo_agent", "DeepSeek-V4.1-Flash"
-	case "glm-5.3":
-		return "solo_agent", "glm-5.3"
-	case "glm-5.3-flash", "gf":
-		return "solo_agent", "glm-5.3-flash"
-	case "deepseek-v4-pro-official":
-		return "solo_agent", "DeepSeek-V4-Pro-Official"
 	case "deepseek-v4-flash-official":
 		return "solo_agent", "DeepSeek-V4-Flash-Official"
-	case "qwen3.8-max", "qwen-3.8-max":
-		return "solo_agent", "qwen3.8-max"
-	case "doubao-seed-evolving":
-		return "chat_v3", "Doubao-Seed-Evolving"
+	case "deepseek-v4-pro-official", "deepseek-v4-pro", "dsp", "deepseek-pro":
+		return "solo_agent", "DeepSeek-V4-Pro-Official"
+	case "deepseek-v3", "deepseek-chat":
+		return "solo_agent", "DeepSeek-V4-Pro"
+	case "deepseek-r1", "deepseek-reasoner":
+		return "chat_v3", "custom_model_deepseek_reasoner"
+	case "deepseek-v3-1", "deepseek-v3.1":
+		return "chat_v3", "deepseek-V3.1"
+
+	// GLM series
+	case "glm-5.3-flash", "gf":
+		return "solo_agent", "glm-5.3-flash"
+	case "glm-5.3":
+		return "solo_agent", "glm-5.3"
 	case "glm-5.2":
-		return "chat_v3", "glm-5.2"
+		return "solo_agent", "glm-5.2"
 	case "glm-5.1":
 		return "chat_v3", "glm-5.1"
 	case "glm-5":
@@ -72,40 +83,34 @@ func ResolveTraeModel(model string) (functionName string, configName string) {
 		return "chat_v3", "glm-4.7"
 	case "glm-4.6":
 		return "chat_v3", "glm-4.6"
-	case "doubao-seed-code", "doubao-1-6", "doubao_1_6":
-		return "chat_v3", "Doubao_1_6"
+
+	// Qwen series
+	case "qwen3.8-max", "qwen-3.8-max":
+		return "solo_agent", "qwen3.8-max"
+	case "qwen-3.7-plus", "qwen3.7-plus", "qwen-plus", "qwen":
+		return "solo_agent", "qwen-3.7-plus"
+	case "qwen-3.6-plus", "qwen3.6-plus":
+		return "solo_agent", "qwen-3.6-plus"
+	case "qwen-3.5", "qwen-3-5", "qwen3.5":
+		return "chat_v3", "qwen-3.5"
+	case "qwen3-coder", "qwen-3-coder":
+		return "chat_v3", "qwen3-coder"
+
+	// Doubao series
+	case "doubao-seed-code", "doubao-1-6", "doubao_1_6", "doubao":
+		return "solo_agent", "Doubao_1_6"
 	case "doubao-seed-2.0-code":
-		return "chat_v3", "Doubao-Seed-2.0-Code"
+		return "solo_agent", "Doubao-Seed-2.0-Code"
+	case "doubao-seed-evolving":
+		return "solo_agent", "Doubao-Seed-Evolving"
 	case "doubao-1.8", "doubao_1_8":
 		return "chat_v3", "doubao_1_8"
 	case "doubao-seed-2-1-pro":
 		return "chat_v3", "Doubao-Seed-2.1-Pro"
 	case "doubao-seed-2-1-turbo":
 		return "chat_v3", "Doubao-Seed-2.1-Turbo"
-	case "deepseek-v4-pro", "deepseek-v3", "deepseek-chat":
-		return "chat_v3", "deepseek-V4-Pro"
-	case "deepseek-v4-flash":
-		return "chat_v3", "DeepSeek-V4-Flash"
-	case "deepseek-r1", "deepseek-reasoner":
-		return "chat_v3", "custom_model_deepseek_reasoner"
-	case "deepseek-v3-1", "deepseek-v3.1":
-		return "chat_v3", "deepseek-V3.1"
-	case "qwen-3.7-plus", "qwen3.7-plus":
-		return "chat_v3", "qwen-3.7-plus"
-	case "qwen-3.6-plus", "qwen3.6-plus":
-		return "chat_v3", "qwen-3.6-plus"
-	case "qwen-3.5", "qwen-3-5", "qwen3.5":
-		return "chat_v3", "qwen-3.5"
-	case "qwen3-coder", "qwen-3-coder":
-		return "chat_v3", "qwen3-coder"
-	case "kimi-k2.6":
-		return "chat_v3", "kimi-k2.6"
-	case "kimi-k2.5", "kimi-k2-5":
-		return "chat_v3", "kimi-k2.5"
-	case "kimi-k2":
-		return "chat_v3", "kimi-k2"
-	case "kimi-k2-7-code", "kimi-k2.7-code":
-		return "chat_v3", "kimi-k2.7-code"
+
+	// MiniMax series
 	case "minimax-m3":
 		return "chat_v3", "minimax-m3"
 	case "minimax-m2.7":
@@ -120,7 +125,7 @@ func ResolveTraeModel(model string) (functionName string, configName string) {
 	if strings.HasPrefix(m, "claude-opus") || strings.HasPrefix(m, "claude-sonnet") ||
 		strings.Contains(m, "3-7-sonnet") || strings.Contains(m, "3.7-sonnet") ||
 		strings.Contains(m, "3-5-sonnet") || strings.Contains(m, "3.5-sonnet") {
-		return "chat_v3", "glm-5.2"
+		return "solo_agent", "glm-5.3-flash"
 	}
 	if strings.HasPrefix(m, "claude-haiku") || strings.Contains(m, "3-5-haiku") || strings.Contains(m, "3.5-haiku") {
 		return "chat_v3", "glm-5.1"
