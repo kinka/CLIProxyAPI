@@ -984,7 +984,21 @@ var (
 	xmlParamRegex   = regexp.MustCompile(`<param\s+name=["']([^"']+)["'][^>]*>([\s\S]*?)</param>`)
 	reToolCall      = regexp.MustCompile(`(?s)<(?:tool_call|toolcall)(?:\s+name=["']([^"']+)["'])?[^>]*>(.*?)</(?:tool_call|toolcall)>`)
 	reLooseToolCall = regexp.MustCompile(`(?s)<(?:tool_call|toolcall)(?:\s+name=["']([^"']+)["'])?[^>]*>(.*?)(?:</(?:tool_call|toolcall)>|$)`)
+	reToolName      = regexp.MustCompile(`^[A-Za-z_][A-Za-z0-9_.\-]*$`)
 )
+
+// isPlausibleToolName reports whether a name scraped out of free-form text could
+// actually be a tool name. The heuristic parse branches below take the first
+// whitespace-delimited token as the name, so a truncated tool call leaves them
+// holding a fragment such as `{"name":"Bash","index":1,"argument`. Emitting that
+// as a tool call makes the client answer "No such tool available" and kills the
+// turn, so reject anything that is not shaped like an identifier.
+func isPlausibleToolName(name string) bool {
+	if name == "" || len(name) > 64 {
+		return false
+	}
+	return reToolName.MatchString(name)
+}
 
 func buildToolCall(rawName string, params any, toolMap map[string]string) TraeToolCall {
 	rawName = strings.TrimSpace(rawName)
@@ -1102,7 +1116,9 @@ func ParseToolcallContent(inner string, toolMap map[string]string) (TraeToolCall
 		lines := strings.Split(trimmed, "\n")
 		firstLine := strings.TrimSpace(lines[0])
 		if !strings.HasPrefix(firstLine, "<param") {
-			name = strings.Fields(firstLine)[0]
+			if headFields := strings.Fields(firstLine); len(headFields) > 0 && isPlausibleToolName(headFields[0]) {
+				name = headFields[0]
+			}
 		}
 		for _, m := range matchesParam {
 			params[m[1]] = strings.TrimSpace(m[2])
@@ -1123,7 +1139,7 @@ func ParseToolcallContent(inner string, toolMap map[string]string) (TraeToolCall
 	if len(matchesArg) > 0 {
 		fields := strings.Fields(trimmed)
 		name := ""
-		if len(fields) > 0 && !strings.HasPrefix(fields[0], "<") {
+		if len(fields) > 0 && isPlausibleToolName(fields[0]) {
 			name = fields[0]
 		}
 		params := make(map[string]any)
@@ -1156,7 +1172,7 @@ func ParseToolcallContent(inner string, toolMap map[string]string) (TraeToolCall
 
 	// 6. XML attribute style: ToolName key="value"
 	fields := strings.Fields(trimmed)
-	if len(fields) > 0 && !strings.HasPrefix(fields[0], "<") {
+	if len(fields) > 0 && isPlausibleToolName(fields[0]) {
 		name := fields[0]
 		attrMatches := xmlAttrRegex.FindAllStringSubmatch(trimmed, -1)
 		if len(attrMatches) > 0 {

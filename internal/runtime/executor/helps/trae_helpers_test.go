@@ -442,3 +442,38 @@ func TestFormatTraeMessagesWithTools_ParallelResults(t *testing.T) {
 		t.Errorf("expected continuation rule reminder in last message: %s", txt)
 	}
 }
+
+// A tool call that upstream cut off mid-JSON used to fall through to the
+// "ToolName key=value" heuristic, which took the truncated JSON head as the tool
+// name and the surrounding attributes as arguments. The client answered
+// "No such tool available: {\"name\":\"Bash\",\"index\":1,\"argument" and the turn
+// died, so a fragment like this must be rejected instead.
+func TestParseToolcallContentRejectsTruncatedJSONHead(t *testing.T) {
+	toolMap := map[string]string{"bash": "Bash", "read": "Read"}
+	cases := []string{
+		`{"name":"Bash","index":1,"argument`,
+		`{"name":"Bash","index":1,"argument <arg key="command" type="string">ls</arg>`,
+		"{\"name\":\"Bash\",\"index\":1,\"argument\n<parameter key=\"command\" type=\"string\">ls -la</parameter>",
+	}
+	for _, c := range cases {
+		if tc, ok := helps.ParseToolcallContent(c, toolMap); ok {
+			t.Errorf("truncated tool call was accepted as %q with args %s\ninput: %s", tc.Name, tc.Args, c)
+		}
+	}
+}
+
+// The guard must not break the heuristic it protects: a real unterminated tool
+// call written in attribute style still has to be recovered.
+func TestParseToolcallContentStillRecoversAttributeStyle(t *testing.T) {
+	toolMap := map[string]string{"bash": "Bash"}
+	tc, ok := helps.ParseToolcallContent(`Bash command="ls -la"`, toolMap)
+	if !ok {
+		t.Fatal("attribute-style tool call was rejected")
+	}
+	if tc.Name != "Bash" {
+		t.Errorf("expected name Bash, got %q", tc.Name)
+	}
+	if !strings.Contains(tc.Args, `"command"`) {
+		t.Errorf("expected command argument, got %s", tc.Args)
+	}
+}
