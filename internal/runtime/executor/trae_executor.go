@@ -692,7 +692,7 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 		toolFilter := helps.NewToolCallStreamFilter(toolMap)
 		var fullAssistantContent strings.Builder
 		autoDriveCount := 0
-		const maxAutoDrive = 2
+		const maxAutoDrive = 3
 
 		for scanner.Scan() {
 			line := scanner.Text()
@@ -817,16 +817,36 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				// prompt the model to call the tool immediately within the same turn.
 				hasEmittedCalls := toolFilter.HasEmittedCalls() || len(finalCalls) > 0
 				accumulatedText := strings.TrimSpace(fullAssistantContent.String())
-				if !hasEmittedCalls && helps.IsTransitionalDeferralText(accumulatedText) && autoDriveCount < maxAutoDrive {
+				// An earlier drive that came back with no content at all would otherwise fall
+				// through to end_turn and stall the agent loop, so keep driving in that case too.
+				emptyContinuation := accumulatedText == "" && autoDriveCount > 0
+				needsAutoDrive := !hasEmittedCalls && autoDriveCount < maxAutoDrive &&
+					(emptyContinuation || helps.IsTransitionalDeferralText(accumulatedText))
+				if needsAutoDrive {
 					autoDriveCount++
-					log.Infof("trae executor stream: detected transitional deferral %q with no tool call, auto-driving (attempt %d/%d)", accumulatedText, autoDriveCount, maxAutoDrive)
+					var prompt string
+					if emptyContinuation {
+						log.Infof("trae executor stream: continuation returned no content and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
+						prompt = "【Agent Action Rule: Your previous reply was empty. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】"
+					} else {
+						log.Infof("trae executor stream: detected transitional deferral %q with no tool call, auto-driving (attempt %d/%d)", accumulatedText, autoDriveCount, maxAutoDrive)
+						prompt = fmt.Sprintf("【Agent Action Rule: You stated: %q. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】", accumulatedText)
+					}
 
-					prompt := fmt.Sprintf("【Agent Action Rule: You stated: %q. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】", accumulatedText)
-					newPayload, errAppend := helps.AppendMessagesToPayload(currentPayload,
-						map[string]any{"role": "assistant", "content": accumulatedText},
-						map[string]any{"role": "user", "content": prompt},
-					)
+					extraMsgs := make([]map[string]any, 0, 2)
+					if accumulatedText != "" {
+						extraMsgs = append(extraMsgs, map[string]any{"role": "assistant", "content": accumulatedText})
+					}
+					extraMsgs = append(extraMsgs, map[string]any{"role": "user", "content": prompt})
+					newPayload, errAppend := helps.AppendMessagesToPayload(currentPayload, extraMsgs...)
 					if errAppend == nil {
+						// Back-to-back requests on the same conversation can come back empty,
+						// so space the continuation out slightly before retrying.
+						select {
+						case <-time.After(time.Duration(autoDriveCount) * 400 * time.Millisecond):
+						case <-ctx.Done():
+							return
+						}
 						newTraeBody, _, errNewBuild := chosenPlan.buildBody(newPayload, baseModel, storage, true)
 						if errNewBuild == nil {
 							newReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, chosenURL, bytes.NewReader(newTraeBody))
@@ -878,6 +898,9 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 					finishReason = "tool_calls"
 				} else if finishReason == "" {
 					finishReason = "stop"
+				}
+				if autoDriveCount > 0 && finishReason != "tool_calls" {
+					log.Warnf("trae executor stream: auto-drive exhausted after %d attempt(s), turn still ends without a tool call (text=%q)", autoDriveCount, strings.TrimSpace(fullAssistantContent.String()))
 				}
 
 				doneChunkJSON := helps.FormatOpenAIStreamChunk(compID, req.Model, "", "", finishReason)

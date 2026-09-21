@@ -6,6 +6,7 @@ import (
 	"net/http"
 	"net/http/httptest"
 	"strings"
+	"sync/atomic"
 	"testing"
 	"time"
 
@@ -122,8 +123,9 @@ func TestBuildTraeRequestBody(t *testing.T) {
 	}
 
 	parsed := gjson.ParseBytes(body)
-	if parsed.Get("function").String() != "chat_v3" {
-		t.Errorf("expected function chat_v3, got %q", parsed.Get("function").String())
+	// Mainstream models are routed through solo_agent so tool calling works.
+	if parsed.Get("function").String() != "solo_agent" {
+		t.Errorf("expected function solo_agent, got %q", parsed.Get("function").String())
 	}
 	if parsed.Get("config_name").String() != "glm-5.2" {
 		t.Errorf("expected config_name glm-5.2, got %q", parsed.Get("config_name").String())
@@ -567,5 +569,131 @@ func TestTraeExecutorToolCallsStreamingAndNonStreaming(t *testing.T) {
 	}
 	if !strings.Contains(sseStr, `"stop_reason":"tool_use"`) {
 		t.Errorf("expected sse stream to contain stop_reason tool_use, got:\n%s", sseStr)
+	}
+}
+
+// traeAutoDriveServer builds a fake Trae upstream that serves a scripted SSE
+// body per incoming request, so auto-drive continuation can be asserted
+// deterministically.
+func traeAutoDriveServer(t *testing.T, scripts [][]string, hits *int32) *httptest.Server {
+	t.Helper()
+	return httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := int(atomic.AddInt32(hits, 1)) - 1
+		if idx >= len(scripts) {
+			idx = len(scripts) - 1
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		for _, l := range scripts[idx] {
+			_, _ = w.Write([]byte(l))
+			flusher.Flush()
+		}
+	}))
+}
+
+func traeAutoDriveClaudeStream(t *testing.T, serverURL string) string {
+	t.Helper()
+	exec := NewTraeExecutor(&config.Config{})
+	auth := &cliproxyauth.Auth{
+		ID:       "test-trae-autodrive",
+		Provider: "trae",
+		Storage: &traeauth.TraeTokenStorage{
+			AccessToken: "test-token",
+			Host:        serverURL,
+		},
+	}
+	claudePayload := []byte(`{
+		"model": "glm-5.3-flash",
+		"stream": true,
+		"messages": [{"role": "user", "content": "排查一下这个问题"}],
+		"tools": [
+			{
+				"name": "Bash",
+				"description": "Run shell command",
+				"input_schema": {"type": "object", "properties": {"command": {"type": "string"}}}
+			}
+		]
+	}`)
+	streamRes, err := exec.ExecuteStream(context.Background(), auth, cliproxyexecutor.Request{
+		Model:   "glm-5.3-flash",
+		Payload: claudePayload,
+	}, cliproxyexecutor.Options{SourceFormat: sdktranslator.FormatClaude})
+	if err != nil {
+		t.Fatalf("stream execute failed: %v", err)
+	}
+	var sb strings.Builder
+	for c := range streamRes.Chunks {
+		if c.Err != nil {
+			t.Fatalf("unexpected stream err: %v", c.Err)
+		}
+		sb.Write(c.Payload)
+	}
+	return sb.String()
+}
+
+var (
+	traeDeferralScript = []string{
+		"event: output\n",
+		`data: {"content":"` + "`apiCall` 没有导出，我直接写个临时脚本调 management 接口：" + `"}` + "\n\n",
+		"event: done\n",
+		`data: {"finish_reason":"stop"}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	traeToolCallScript = []string{
+		"event: output\n",
+		`data: {"content":"<toolcall>{\"name\": \"Bash\", \"params\": {\"command\": \"pwd\"}}</toolcall>"}` + "\n\n",
+		"event: done\n",
+		`data: {"finish_reason":"stop"}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+	// Upstream accepts the retry but yields no content at all before done.
+	traeEmptyScript = []string{
+		"event: done\n",
+		`data: {"finish_reason":"stop"}` + "\n\n",
+		"data: [DONE]\n\n",
+	}
+)
+
+// A transitional deferral must be auto-driven into a real tool call so that
+// Claude Code keeps the agent loop running instead of returning to the user.
+func TestTraeAutoDriveConvertsDeferralIntoToolUse(t *testing.T) {
+	var hits int32
+	server := traeAutoDriveServer(t, [][]string{traeDeferralScript, traeToolCallScript}, &hits)
+	defer server.Close()
+
+	sse := traeAutoDriveClaudeStream(t, server.URL)
+
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("expected 2 upstream requests (original + auto-drive), got %d", got)
+	}
+	if !strings.Contains(sse, `"type":"tool_use"`) {
+		t.Errorf("expected tool_use block after auto-drive, got:\n%s", sse)
+	}
+	if !strings.Contains(sse, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason tool_use after auto-drive, got:\n%s", sse)
+	}
+	if strings.Contains(sse, `"stop_reason":"end_turn"`) {
+		t.Errorf("auto-drive turn must not end with end_turn, got:\n%s", sse)
+	}
+}
+
+// If the auto-drive retry comes back empty, the executor must drive again
+// rather than silently falling through to end_turn.
+func TestTraeAutoDriveRetriesWhenContinuationIsEmpty(t *testing.T) {
+	var hits int32
+	server := traeAutoDriveServer(t, [][]string{traeDeferralScript, traeEmptyScript, traeToolCallScript}, &hits)
+	defer server.Close()
+
+	sse := traeAutoDriveClaudeStream(t, server.URL)
+
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("expected 3 upstream requests (original + 2 auto-drives), got %d", got)
+	}
+	if !strings.Contains(sse, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason tool_use after second auto-drive, got:\n%s", sse)
 	}
 }
