@@ -837,33 +837,41 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				needsAutoDrive := !hasEmittedCalls && autoDriveCount < maxAutoDrive &&
 					(autoDriveCount > 0 || emptyTurn || helps.IsTransitionalDeferralText(accumulatedText))
 				if needsAutoDrive {
-					autoDriveCount++
-					var prompt string
-					switch {
-					case accumulatedText != "":
-						log.Infof("trae executor stream: detected transitional deferral %q with no tool call, auto-driving (attempt %d/%d)", accumulatedText, autoDriveCount, maxAutoDrive)
-						prompt = fmt.Sprintf("【Agent Action Rule: You stated: %q. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】", accumulatedText)
-					case reasoningOnly:
-						log.Infof("trae executor stream: turn produced reasoning but no reply and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
-						prompt = "【Agent Action Rule: Your previous turn produced internal reasoning but no reply and no action. Stop deliberating. Call the next tool immediately using <toolcall> to execute your action now.】"
-					default:
-						log.Infof("trae executor stream: turn produced no content and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
-						prompt = "【Agent Action Rule: Your previous reply was empty. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】"
-					}
+					swapped := false
+					// A transport failure used to fall straight through to end_turn and burn
+					// the rest of the budget. Keep trying until a continuation stream is in
+					// hand or the budget is actually spent.
+					for autoDriveCount < maxAutoDrive && !swapped {
+						autoDriveCount++
+						var prompt string
+						switch {
+						case accumulatedText != "":
+							log.Infof("trae executor stream: detected transitional deferral %q with no tool call, auto-driving (attempt %d/%d)", accumulatedText, autoDriveCount, maxAutoDrive)
+							prompt = fmt.Sprintf("【Agent Action Rule: You stated: %q. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】", accumulatedText)
+						case reasoningOnly:
+							log.Infof("trae executor stream: turn produced reasoning but no reply and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
+							prompt = "【Agent Action Rule: Your previous turn produced internal reasoning but no reply and no action. Stop deliberating. Call the next tool immediately using <toolcall> to execute your action now.】"
+						default:
+							log.Infof("trae executor stream: turn produced no content and no tool call, auto-driving (attempt %d/%d)", autoDriveCount, maxAutoDrive)
+							prompt = "【Agent Action Rule: Your previous reply was empty. DO NOT pause or explain. Call the next tool immediately using <toolcall> to execute your action now.】"
+						}
 
-					// Remember the last real assistant text so later attempts keep the
-					// assistant/user alternation intact even when a continuation comes back
-					// without any body text.
-					if accumulatedText != "" {
-						driveAssistantText = accumulatedText
-					}
-					extraMsgs := make([]map[string]any, 0, 2)
-					if driveAssistantText != "" {
-						extraMsgs = append(extraMsgs, map[string]any{"role": "assistant", "content": driveAssistantText})
-					}
-					extraMsgs = append(extraMsgs, map[string]any{"role": "user", "content": prompt})
-					newPayload, errAppend := helps.AppendMessagesToPayload(driveBasePayload, extraMsgs...)
-					if errAppend == nil {
+						// Remember the last real assistant text so later attempts keep the
+						// assistant/user alternation intact even when a continuation comes back
+						// without any body text.
+						if accumulatedText != "" {
+							driveAssistantText = accumulatedText
+						}
+						extraMsgs := make([]map[string]any, 0, 2)
+						if driveAssistantText != "" {
+							extraMsgs = append(extraMsgs, map[string]any{"role": "assistant", "content": driveAssistantText})
+						}
+						extraMsgs = append(extraMsgs, map[string]any{"role": "user", "content": prompt})
+						newPayload, errAppend := helps.AppendMessagesToPayload(driveBasePayload, extraMsgs...)
+						if errAppend != nil {
+							log.Warnf("trae executor stream: auto-drive appendMessages error: %v", errAppend)
+							break
+						}
 						// Back-to-back requests on the same conversation can come back empty,
 						// so space the continuation out slightly before retrying.
 						select {
@@ -872,49 +880,56 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 							return
 						}
 						newTraeBody, _, errNewBuild := chosenPlan.buildBody(newPayload, baseModel, storage, true)
-						if errNewBuild == nil {
-							newReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, chosenURL, bytes.NewReader(newTraeBody))
-							if errNewReq == nil {
-								helps.ApplyTraeHeaders(newReq, storage, true)
-								if chosenPlan.isRaw {
-									newReq.Header.Set("X-App-Function", "solo_agent")
-									newReq.Header.Set("X-Ide-Function", "solo_agent")
-								}
-								if auth != nil {
-									util.ApplyCustomHeadersFromAttrs(newReq, auth.Attributes)
-								}
-								newResp, errNewDo := httpClient.Do(newReq)
-								if errNewDo == nil && newResp.StatusCode >= 200 && newResp.StatusCode < 300 {
-									newPeeked, peekErr, errPeek := peekFirstTraeEvent(newResp)
-									if errPeek == nil && peekErr == nil {
-										_ = currentStreamBody.Close()
-										currentStreamBody = newPeeked
-										scanner = bufio.NewScanner(currentStreamBody)
-										scanner.Buffer(nil, 1048576)
-										currentPayload = newPayload
-										currentEvent = ""
-										fullAssistantContent.Reset()
-										fullAssistantReasoning.Reset()
-										toolFilter = helps.NewToolCallStreamFilter(toolMap)
-										continue
-									} else {
-										log.Warnf("trae executor stream: auto-drive peek error: peekErr=%v, errPeek=%v", peekErr, errPeek)
-									}
-								} else {
-									if errNewDo != nil {
-										log.Warnf("trae executor stream: auto-drive request failed: %v", errNewDo)
-									} else {
-										log.Warnf("trae executor stream: auto-drive HTTP status: %d", newResp.StatusCode)
-									}
-								}
-							} else {
-								log.Warnf("trae executor stream: auto-drive create request error: %v", errNewReq)
-							}
-						} else {
+						if errNewBuild != nil {
 							log.Warnf("trae executor stream: auto-drive buildBody error: %v", errNewBuild)
+							break
 						}
-					} else {
-						log.Warnf("trae executor stream: auto-drive appendMessages error: %v", errAppend)
+						newReq, errNewReq := http.NewRequestWithContext(ctx, http.MethodPost, chosenURL, bytes.NewReader(newTraeBody))
+						if errNewReq != nil {
+							log.Warnf("trae executor stream: auto-drive create request error: %v", errNewReq)
+							break
+						}
+						helps.ApplyTraeHeaders(newReq, storage, true)
+						if chosenPlan.isRaw {
+							newReq.Header.Set("X-App-Function", "solo_agent")
+							newReq.Header.Set("X-Ide-Function", "solo_agent")
+						}
+						if auth != nil {
+							util.ApplyCustomHeadersFromAttrs(newReq, auth.Attributes)
+						}
+						newResp, errNewDo := httpClient.Do(newReq)
+						if errNewDo != nil || newResp.StatusCode < 200 || newResp.StatusCode >= 300 {
+							if newResp != nil && newResp.Body != nil {
+								_ = newResp.Body.Close()
+							}
+							if errNewDo != nil {
+								log.Warnf("trae executor stream: auto-drive request failed: %v", errNewDo)
+							} else {
+								log.Warnf("trae executor stream: auto-drive HTTP status: %d", newResp.StatusCode)
+							}
+							continue
+						}
+						newPeeked, peekErr, errPeek := peekFirstTraeEvent(newResp)
+						if errPeek != nil || peekErr != nil {
+							if errPeek != nil && newResp.Body != nil {
+								_ = newResp.Body.Close()
+							}
+							log.Warnf("trae executor stream: auto-drive peek error: peekErr=%v, errPeek=%v", peekErr, errPeek)
+							continue
+						}
+						_ = currentStreamBody.Close()
+						currentStreamBody = newPeeked
+						scanner = bufio.NewScanner(currentStreamBody)
+						scanner.Buffer(nil, 1048576)
+						currentPayload = newPayload
+						currentEvent = ""
+						fullAssistantContent.Reset()
+						fullAssistantReasoning.Reset()
+						toolFilter = helps.NewToolCallStreamFilter(toolMap)
+						swapped = true
+					}
+					if swapped {
+						continue
 					}
 				}
 

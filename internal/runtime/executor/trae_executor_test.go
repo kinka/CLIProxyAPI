@@ -824,6 +824,44 @@ func TestTraeAutoDriveRetriesWhenContinuationIsEmpty(t *testing.T) {
 	}
 }
 
+// A continuation that fails in transport (proxy refused, non-2xx) must spend the
+// remaining budget on another try. Falling through to end_turn on the first
+// failure is what turned a one-second proxy blip into a dead turn.
+func TestTraeAutoDriveRetriesWhenContinuationRequestFails(t *testing.T) {
+	var hits int32
+	server := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		idx := int(atomic.AddInt32(&hits, 1)) - 1
+		if idx == 1 {
+			http.Error(w, "proxy down", http.StatusBadGateway)
+			return
+		}
+		script := traeDeferralScript
+		if idx >= 2 {
+			script = traeToolCallScript
+		}
+		w.Header().Set("Content-Type", "text/event-stream")
+		flusher, ok := w.(http.Flusher)
+		if !ok {
+			return
+		}
+		w.WriteHeader(http.StatusOK)
+		for _, l := range script {
+			_, _ = w.Write([]byte(l))
+			flusher.Flush()
+		}
+	}))
+	defer server.Close()
+
+	sse := traeAutoDriveClaudeStream(t, server.URL)
+
+	if got := atomic.LoadInt32(&hits); got != 3 {
+		t.Fatalf("expected 3 upstream requests (deferral + failed drive + retry), got %d", got)
+	}
+	if !strings.Contains(sse, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason tool_use after retrying a failed continuation, got:\n%s", sse)
+	}
+}
+
 // An upstream turn that yields nothing at all must be driven too: Claude Code
 // renders an empty end_turn response as a dead "No response requested." turn.
 func TestTraeAutoDriveRecoversEmptyFirstTurn(t *testing.T) {
