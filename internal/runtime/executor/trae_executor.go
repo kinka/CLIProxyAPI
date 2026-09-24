@@ -830,12 +830,17 @@ func (e *TraeExecutor) ExecuteStream(ctx context.Context, auth *cliproxyauth.Aut
 				reasoningOnly := accumulatedText == "" && strings.TrimSpace(fullAssistantReasoning.String()) != ""
 				// A turn with no content at all would otherwise fall through to end_turn and
 				// stall the agent loop, so drive it the same way a deferral is driven.
+				// Reasoning-only is not empty — the model did produce output — but clients
+				// that hide thinking render it as a blank end_turn and resubmit the turn.
+				// When tools are available, drive that first turn too. The reasoning-only
+				// prompt below is otherwise only reachable after a drive has already started.
 				emptyTurn := accumulatedText == "" && !reasoningOnly
 				// Once a drive is under way the turn is already known to be stalled, so keep
 				// driving until the budget runs out instead of demanding that each follow-up
 				// also look like a deferral.
 				needsAutoDrive := !hasEmittedCalls && autoDriveCount < maxAutoDrive &&
-					(autoDriveCount > 0 || emptyTurn || helps.IsTransitionalDeferralText(accumulatedText))
+					(autoDriveCount > 0 || emptyTurn || helps.IsTransitionalDeferralText(accumulatedText) ||
+						(reasoningOnly && len(toolMap) > 0))
 				if needsAutoDrive {
 					swapped := false
 					// A transport failure used to fall straight through to end_turn and burn

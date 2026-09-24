@@ -862,6 +862,27 @@ func TestTraeAutoDriveRetriesWhenContinuationRequestFails(t *testing.T) {
 	}
 }
 
+// The first upstream turn may itself be reasoning with no reply and no tool
+// call. That used to be treated as a finished end_turn, so clients that hide
+// thinking resent "上一轮没有给出可见回复" and the same stall repeated.
+func TestTraeAutoDriveRecoversReasoningOnlyFirstTurn(t *testing.T) {
+	var hits int32
+	server := traeAutoDriveServer(t, [][]string{traeReasoningOnlyScript, traeToolCallScript}, &hits)
+	defer server.Close()
+
+	sse := traeAutoDriveClaudeStream(t, server.URL)
+
+	if got := atomic.LoadInt32(&hits); got != 2 {
+		t.Fatalf("expected 2 upstream requests (reasoning-only original + auto-drive), got %d", got)
+	}
+	if !strings.Contains(sse, `"stop_reason":"tool_use"`) {
+		t.Errorf("expected stop_reason tool_use after driving a reasoning-only first turn, got:\n%s", sse)
+	}
+	if strings.Contains(sse, `"stop_reason":"end_turn"`) {
+		t.Errorf("reasoning-only first turn must not end the turn, got:\n%s", sse)
+	}
+}
+
 // An upstream turn that yields nothing at all must be driven too: Claude Code
 // renders an empty end_turn response as a dead "No response requested." turn.
 func TestTraeAutoDriveRecoversEmptyFirstTurn(t *testing.T) {
