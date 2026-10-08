@@ -1,69 +1,89 @@
 package api
 
 import (
-	"bufio"
 	"context"
-	"fmt"
 	"net"
 	"net/http"
 	"testing"
 	"time"
+
+	"github.com/gin-gonic/gin"
+	"github.com/router-for-me/CLIProxyAPI/v8/internal/config"
 )
 
-// TestStopForceClosesConnectionsAfterShutdownTimeout guards the restart race that
-// surfaced as "unknown provider for model ...": when graceful shutdown gives up,
-// the surviving keep-alive connections must be dropped instead of continuing to
-// reach the handlers while the caller tears the model registry down.
-func TestStopForceClosesConnectionsAfterShutdownTimeout(t *testing.T) {
-	entered := make(chan struct{})
-	release := make(chan struct{})
+func TestServerStop_ViolentShutdownImmediatelyClosesWithoutContextDeadlineError(t *testing.T) {
+	gin.SetMode(gin.TestMode)
 
-	mux := http.NewServeMux()
-	mux.HandleFunc("/block", func(w http.ResponseWriter, _ *http.Request) {
-		close(entered)
-		<-release
-		w.WriteHeader(http.StatusOK)
+	// Create a listener on a random available port.
+	ln, err := net.Listen("tcp", "127.0.0.1:0")
+	if err != nil {
+		t.Fatalf("failed to listen: %v", err)
+	}
+
+	port := ln.Addr().(*net.TCPAddr).Port
+
+	cfg := &config.Config{
+		Host: "127.0.0.1",
+		Port: port,
+	}
+
+	server := NewServer(cfg, nil, nil, "")
+	engine := gin.New()
+	reqStarted := make(chan struct{})
+	engine.GET("/slow", func(c *gin.Context) {
+		close(reqStarted)
+		time.Sleep(2 * time.Second)
+		c.String(http.StatusOK, "ok")
 	})
+	server.server.Handler = engine
 
-	listener, errListen := net.Listen("tcp", "127.0.0.1:0")
-	if errListen != nil {
-		t.Fatalf("listen: %v", errListen)
-	}
-	httpServer := &http.Server{Handler: mux}
-	go func() { _ = httpServer.Serve(listener) }()
+	// Start the server with the listener.
+	go func() {
+		_ = server.server.Serve(ln)
+	}()
 
-	conn, errDial := net.Dial("tcp", listener.Addr().String())
-	if errDial != nil {
-		t.Fatalf("dial: %v", errDial)
-	}
-	defer func() { _ = conn.Close() }()
+	// Start an in-flight request.
+	reqDone := make(chan error, 1)
+	go func() {
+		resp, errGet := http.Get("http://" + ln.Addr().String() + "/slow")
+		if errGet != nil {
+			reqDone <- errGet
+			return
+		}
+		defer func() {
+			if errCloseBody := resp.Body.Close(); errCloseBody != nil {
+				t.Logf("response body close error: %v", errCloseBody)
+			}
+		}()
+		reqDone <- nil
+	}()
 
-	if _, errWrite := fmt.Fprint(conn, "GET /block HTTP/1.1\r\nHost: test\r\n\r\n"); errWrite != nil {
-		t.Fatalf("write request: %v", errWrite)
-	}
+	<-reqStarted
 
-	select {
-	case <-entered:
-	case <-time.After(5 * time.Second):
-		t.Fatal("handler never received the request")
-	}
-
-	s := &Server{server: httpServer}
-	ctx, cancel := context.WithTimeout(context.Background(), 200*time.Millisecond)
+	// Call server.Stop with an expired context (simulating the expired shutdown deadline).
+	// Under violent shutdown (s.server.Close), the server should immediately close in-flight
+	// connections without waiting and without returning context deadline exceeded.
+	expiredCtx, cancel := context.WithDeadline(context.Background(), time.Now().Add(-time.Second))
 	defer cancel()
 
-	// The in-flight request keeps the connection busy, so graceful shutdown times out.
-	if errStop := s.Stop(ctx); errStop == nil {
-		t.Fatal("expected Stop to report a shutdown timeout")
+	stopStart := time.Now()
+	errStop := server.Stop(expiredCtx)
+	stopDuration := time.Since(stopStart)
+
+	if stopDuration >= time.Second {
+		t.Fatalf("server.Stop took %v, want immediate violent shutdown (<1s)", stopDuration)
+	}
+	if errStop != nil {
+		t.Fatalf("server.Stop error = %v, want nil for violent shutdown", errStop)
 	}
 
-	// Stop must have force-closed the connection; unblocking the handler afterwards
-	// should not produce a response on the wire.
-	close(release)
-	if errDeadline := conn.SetReadDeadline(time.Now().Add(2 * time.Second)); errDeadline != nil {
-		t.Fatalf("set read deadline: %v", errDeadline)
-	}
-	if _, errRead := bufio.NewReader(conn).ReadString('\n'); errRead == nil {
-		t.Fatal("connection survived the shutdown timeout and still served the request")
+	// Verify the in-flight request was terminated / interrupted.
+	select {
+	case errReq := <-reqDone:
+		if errReq == nil {
+			t.Fatal("expected in-flight request to be interrupted/error, but it completed successfully")
+		}
+	case <-time.After(time.Second):
+		t.Fatal("timed out waiting for in-flight request to be interrupted by server.Stop")
 	}
 }
