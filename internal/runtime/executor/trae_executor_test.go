@@ -2,7 +2,9 @@ package executor
 
 import (
 	"context"
+	"encoding/base64"
 	"encoding/json"
+	"fmt"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -27,6 +29,68 @@ func TestTraeExecutorIdentifier(t *testing.T) {
 	exec := NewTraeExecutor(&config.Config{})
 	if id := exec.Identifier(); id != "trae" {
 		t.Fatalf("expected identifier 'trae', got %q", id)
+	}
+}
+
+func TestTraeExecutorRefreshKeepsOmittedCredentialFields(t *testing.T) {
+	const exp int64 = 1791174647
+	header := base64.RawURLEncoding.EncodeToString([]byte(`{"alg":"none"}`))
+	payload := base64.RawURLEncoding.EncodeToString([]byte(fmt.Sprintf(`{"exp":%d}`, exp)))
+	token := header + "." + payload + ".sig"
+
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path != "/cloudide/api/v3/trae/oauth/ExchangeToken" {
+			t.Errorf("unexpected path %s", r.URL.Path)
+		}
+		w.Header().Set("Content-Type", "application/json")
+		fmt.Fprintf(w, `{"message":"","Data":{"Token":%q}}`, token)
+	}))
+	defer srv.Close()
+
+	storage := &traeauth.TraeTokenStorage{
+		AccessToken:    "old-access",
+		RefreshToken:   "old-refresh",
+		Expired:        "2026-10-05T04:30:47Z",
+		RefreshExpired: "2026-12-20T04:30:47Z",
+		AuthHost:       srv.URL,
+		Type:           "trae",
+	}
+	auth := &cliproxyauth.Auth{
+		Storage: storage,
+		Metadata: map[string]any{
+			"access_token":    "old-access",
+			"refresh_token":   "old-refresh",
+			"expired":         storage.Expired,
+			"refresh_expired": storage.RefreshExpired,
+		},
+	}
+
+	updated, err := NewTraeExecutor(&config.Config{}).Refresh(context.Background(), auth)
+	if err != nil {
+		t.Fatalf("Refresh: %v", err)
+	}
+	if updated.Metadata["access_token"] != token {
+		t.Fatalf("access_token = %v", updated.Metadata["access_token"])
+	}
+	if updated.Metadata["refresh_token"] != "old-refresh" {
+		t.Fatalf("refresh_token wiped: %v", updated.Metadata["refresh_token"])
+	}
+	if updated.Metadata["refresh_expired"] != "2026-12-20T04:30:47Z" {
+		t.Fatalf("refresh_expired wiped: %v", updated.Metadata["refresh_expired"])
+	}
+	wantExpired := time.Unix(exp, 0).UTC().Format(time.RFC3339)
+	if updated.Metadata["expired"] != wantExpired {
+		t.Fatalf("expired = %v, want %s", updated.Metadata["expired"], wantExpired)
+	}
+	gotStorage, ok := updated.Storage.(*traeauth.TraeTokenStorage)
+	if !ok {
+		t.Fatalf("storage type %T", updated.Storage)
+	}
+	if gotStorage.RefreshToken != "old-refresh" || gotStorage.AccessToken != token {
+		t.Fatalf("storage = %+v", gotStorage)
+	}
+	if storage.AccessToken != "old-access" || storage.RefreshToken != "old-refresh" {
+		t.Fatal("original storage was mutated")
 	}
 }
 

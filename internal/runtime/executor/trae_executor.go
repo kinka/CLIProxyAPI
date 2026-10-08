@@ -307,16 +307,23 @@ func (e *TraeExecutor) Refresh(ctx context.Context, auth *cliproxyauth.Auth) (*c
 		cloned.Metadata = make(map[string]any)
 	}
 	cloned.Metadata["access_token"] = resp.Token
-	cloned.Metadata["refresh_token"] = resp.RefreshToken
-	cloned.Metadata["expired"] = resp.ExpiredAt
-	cloned.Metadata["refresh_expired"] = resp.RefreshExpiredAt
-	cloned.LastRefreshedAt = time.Now()
-
 	newStorage := *storage
 	newStorage.AccessToken = resp.Token
-	newStorage.RefreshToken = resp.RefreshToken
-	newStorage.Expired = resp.ExpiredAt
-	newStorage.RefreshExpired = resp.RefreshExpiredAt
+	// Enterprise responses rotate RefreshToken. An empty field means the
+	// payload omitted it; keep the previous credential instead of wiping it.
+	if resp.RefreshToken != "" {
+		cloned.Metadata["refresh_token"] = resp.RefreshToken
+		newStorage.RefreshToken = resp.RefreshToken
+	}
+	if resp.ExpiredAt != "" {
+		cloned.Metadata["expired"] = resp.ExpiredAt
+		newStorage.Expired = resp.ExpiredAt
+	}
+	if resp.RefreshExpiredAt != "" {
+		cloned.Metadata["refresh_expired"] = resp.RefreshExpiredAt
+		newStorage.RefreshExpired = resp.RefreshExpiredAt
+	}
+	cloned.LastRefreshedAt = time.Now()
 	cloned.Storage = &newStorage
 
 	return cloned, nil

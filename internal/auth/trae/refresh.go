@@ -3,13 +3,17 @@ package trae
 import (
 	"bytes"
 	"context"
+	"encoding/base64"
 	"encoding/json"
 	"fmt"
 	"io"
 	"net/http"
 	"os"
+	"strconv"
 	"strings"
 	"time"
+
+	"github.com/tidwall/gjson"
 )
 
 const (
@@ -89,17 +93,135 @@ func ExchangeToken(ctx context.Context, httpClient *http.Client, authHost, refre
 	}
 
 	if resp.StatusCode < 200 || resp.StatusCode >= 300 {
-		return nil, fmt.Errorf("trae: exchange token error (%d): %s", resp.StatusCode, string(respBytes))
+		return nil, fmt.Errorf("trae: exchange token error (%d): %s", resp.StatusCode, traeExchangeErrorDetail(respBytes))
 	}
 
-	var result ExchangeTokenResponse
-	if err := json.Unmarshal(respBytes, &result); err != nil {
-		return nil, fmt.Errorf("trae: failed to parse exchange token response: %w", err)
+	result, err := parseExchangeTokenResponse(respBytes)
+	if err != nil {
+		return nil, err
+	}
+	return result, nil
+}
+
+// parseExchangeTokenResponse accepts both the flat IDE payload
+// ({token, refreshToken, expiredAt}) and the enterprise payload, which
+// nests Token / RefreshToken under Data and sends expiries as unix
+// milliseconds (RefreshExpireAt, TokenExpireAt).
+func parseExchangeTokenResponse(body []byte) (*ExchangeTokenResponse, error) {
+	parsed := gjson.ParseBytes(body)
+	data := parsed.Get("Data")
+	if !data.Exists() || data.Type == gjson.Null {
+		data = parsed.Get("data")
+	}
+	if !data.Exists() || data.Type == gjson.Null {
+		data = parsed
 	}
 
-	if result.Token == "" {
-		return nil, fmt.Errorf("trae: exchange token response missing token: %s", string(respBytes))
+	token := firstNonEmpty(
+		data.Get("Token").String(),
+		data.Get("token").String(),
+		data.Get("access_token").String(),
+	)
+	if token == "" {
+		detail := traeExchangeErrorDetail(body)
+		if detail == "" {
+			return nil, fmt.Errorf("trae: exchange token response missing token")
+		}
+		return nil, fmt.Errorf("trae: exchange token response missing token: %s", detail)
 	}
 
-	return &result, nil
+	expired := traeTimeField(data, "TokenExpireAt", "expiredAt", "expired_at", "expiresAt")
+	if expired == "" {
+		expired = jwtExpRFC3339(token)
+	}
+
+	return &ExchangeTokenResponse{
+		Token:        token,
+		RefreshToken: firstNonEmpty(data.Get("RefreshToken").String(), data.Get("refreshToken").String(), data.Get("refresh_token").String()),
+		ExpiredAt:    expired,
+		RefreshExpiredAt: traeTimeField(data,
+			"RefreshExpireAt", "refreshExpiredAt", "refresh_expired_at", "refreshExpiresAt"),
+		TokenReleaseAt: firstNonEmpty(data.Get("tokenReleaseAt").String(), data.Get("TokenReleaseAt").String()),
+	}, nil
+}
+
+func traeTimeField(data gjson.Result, keys ...string) string {
+	for _, key := range keys {
+		value := data.Get(key)
+		if !value.Exists() || value.Type == gjson.Null {
+			continue
+		}
+		if formatted := formatTraeTimestamp(value); formatted != "" {
+			return formatted
+		}
+	}
+	return ""
+}
+
+func formatTraeTimestamp(value gjson.Result) string {
+	switch value.Type {
+	case gjson.Number:
+		return formatTraeUnix(value.Int())
+	case gjson.String:
+		text := strings.TrimSpace(value.String())
+		if text == "" {
+			return ""
+		}
+		if n, err := strconv.ParseInt(text, 10, 64); err == nil {
+			return formatTraeUnix(n)
+		}
+		return text
+	default:
+		return ""
+	}
+}
+
+func formatTraeUnix(n int64) string {
+	if n <= 0 {
+		return ""
+	}
+	var ts time.Time
+	switch {
+	case n >= 1_000_000_000_000:
+		ts = time.UnixMilli(n)
+	case n >= 1_000_000_000:
+		ts = time.Unix(n, 0)
+	default:
+		return ""
+	}
+	return ts.UTC().Format(time.RFC3339)
+}
+
+func jwtExpRFC3339(token string) string {
+	parts := strings.Split(token, ".")
+	if len(parts) < 2 {
+		return ""
+	}
+	payload, err := base64.RawURLEncoding.DecodeString(parts[1])
+	if err != nil {
+		payload, err = base64.URLEncoding.DecodeString(parts[1])
+		if err != nil {
+			return ""
+		}
+	}
+	var claims map[string]any
+	if err := json.Unmarshal(payload, &claims); err != nil {
+		return ""
+	}
+	switch exp := claims["exp"].(type) {
+	case float64:
+		if exp <= 0 {
+			return ""
+		}
+		return time.Unix(int64(exp), 0).UTC().Format(time.RFC3339)
+	default:
+		return ""
+	}
+}
+
+// traeExchangeErrorDetail returns a log-safe summary. The raw body is not
+// included because a successful enterprise payload carries the new tokens.
+func traeExchangeErrorDetail(body []byte) string {
+	parsed := gjson.ParseBytes(body)
+	return firstNonEmpty(parsed.Get("message").String(), parsed.Get("Message").String())
 }
